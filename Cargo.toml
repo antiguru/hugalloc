@@ -1,12 +1,12 @@
 [package]
-name = "lgalloc"
-version = "0.7.0"
-edition = "2021"
+name = "hugalloc"
+version = "0.1.0"
+edition = "2024"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
-description = "Large object allocator"
+description = "Transparent-huge-page large-object allocator with cooperative residency control"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/antiguru/rust-lgalloc"
-rust-version = "1.72"
+repository = "https://github.com/antiguru/hugalloc"
+rust-version = "1.85"
 
 [dependencies]
 crossbeam-deque = "0.8.5"
