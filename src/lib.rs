@@ -903,7 +903,7 @@ pub struct BackgroundWorkerConfig {
     pub clear_bytes: usize,
 }
 
-/// Lgalloc configuration
+/// hugalloc configuration
 #[derive(Default, Clone, Eq, PartialEq)]
 pub struct LgAlloc {
     /// Whether the allocator is enabled or not.

@@ -63,8 +63,8 @@ fn main() {
     print_header();
 
     for &threads in THREAD_COUNTS {
-        run_bench("hugalloc", threads, bench_lgalloc);
-        run_bench("hugalloc+touch", threads, bench_lgalloc_touch);
+        run_bench("hugalloc", threads, bench_hugalloc);
+        run_bench("hugalloc+touch", threads, bench_hugalloc_touch);
         run_bench("sysalloc", threads, bench_sysalloc);
         run_bench("sysalloc+touch", threads, bench_sysalloc_touch);
         run_bench("sysalloc+nohuge", threads, bench_sysalloc_nohuge);
@@ -233,7 +233,7 @@ fn run_bench(name: &str, threads: usize, f: fn(&AtomicBool, &mut HdrHistogram<u6
 
 // --- Benchmark functions ---
 
-fn bench_lgalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
+fn bench_hugalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
     while running.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (_ptr, _cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
@@ -243,7 +243,7 @@ fn bench_lgalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
     }
 }
 
-fn bench_lgalloc_touch(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
+fn bench_hugalloc_touch(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
     while running.load(Ordering::Relaxed) {
         let start = Instant::now();
         let (ptr, cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
