@@ -1,4 +1,4 @@
-use lgalloc::{allocate, lgalloc_set_config, AllocError, LgAlloc};
+use hugalloc::{allocate, lgalloc_set_config, AllocError, LgAlloc};
 
 #[test]
 fn disabled_allocator_returns_error() {

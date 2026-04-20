@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use lgalloc::{
-    allocate, deallocate, lgalloc_set_config, lgalloc_stats, AllocError, BackgroundWorkerConfig,
+use hugalloc::{
+    allocate, deallocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
     Handle, LgAlloc,
 };
 
@@ -117,7 +117,7 @@ fn concurrent_batch_alloc() -> Result<(), AllocError> {
         handle.join().unwrap();
     }
     std::thread::sleep(Duration::from_secs(1));
-    let stats = lgalloc_stats();
+    let stats = hugalloc::stats();
     for size_class in &stats.size_class {
         println!("size_class {:?}", size_class);
     }

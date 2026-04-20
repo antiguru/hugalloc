@@ -14,16 +14,16 @@ lgalloc = "0.7"
 
 ```rust
 use std::mem::ManuallyDrop;
-fn main() -> Result<(), lgalloc::AllocError> {
-  lgalloc::lgalloc_set_config(
-    lgalloc::LgAlloc::new()
+fn main() -> Result<(), hugalloc::AllocError> {
+  hugalloc::lgalloc_set_config(
+    hugalloc::LgAlloc::new()
       .enable(),
   );
 
   // Allocate memory
-  let (ptr, cap, handle) = lgalloc::allocate::<u8>(2 << 20)?;
+  let (ptr, cap, handle) = hugalloc::allocate::<u8>(2 << 20)?;
   // SAFETY: `allocate` returns a valid memory region and errors otherwise.
-  let mut vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr(), 0, cap) });
+  let mut vec = ManuallyDrop::new(unsafe { Vec::from_raw_parts(ptr.as_ptr() as *mut u8, 0, cap) });
 
   // Write into region, make sure not to reallocate vector.
   vec.extend_from_slice(&[1, 2, 3, 4]);
@@ -32,7 +32,7 @@ fn main() -> Result<(), lgalloc::AllocError> {
   assert_eq!(&*vec, &[1, 2, 3, 4]);
 
   // Deallocate after use
-  lgalloc::deallocate(handle);
+  hugalloc::deallocate(handle);
 
   Ok(())
 }

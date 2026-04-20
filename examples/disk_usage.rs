@@ -1,17 +1,17 @@
-//! Example that demonstrates lgalloc's anonymous memory allocations with THP hints.
+//! Example that demonstrates hugalloc's anonymous memory allocations with THP hints.
 fn main() {
     let buffer_size = 32 << 20;
 
     let buffers = 32;
 
-    let mut config = lgalloc::LgAlloc::new();
+    let mut config = hugalloc::LgAlloc::new();
     config.enable();
     config.eager_return(true);
-    lgalloc::lgalloc_set_config(&config);
+    hugalloc::lgalloc_set_config(&config);
 
     println!("Allocating {buffers} regions of {buffer_size} size...");
     let mut regions: Vec<_> = (0..32)
-        .map(|_| lgalloc::allocate::<u8>(32 << 20).unwrap())
+        .map(|_| hugalloc::allocate::<u8>(32 << 20).unwrap())
         .collect();
     print_stats();
 
@@ -33,7 +33,7 @@ fn main() {
 
     println!("Dropping regions");
     for (_ptr, _cap, handle) in regions.drain(..) {
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
     }
 
     println!("Enter to continue");
@@ -42,7 +42,7 @@ fn main() {
 }
 
 fn print_stats() {
-    let stats = lgalloc::lgalloc_stats();
+    let stats = hugalloc::stats();
 
     for (size_class, stats) in &stats.size_class {
         if stats.areas > 0 {

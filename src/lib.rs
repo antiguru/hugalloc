@@ -18,7 +18,7 @@
 //! to tell the memory subsystem that the shared mappings must not be inherited.
 //!
 //! Clients must not lock pages (`mlock`), or need to unlock the pages before returning them
-//! to lgalloc.
+//! to hugalloc.
 
 #![deny(missing_docs)]
 
@@ -289,7 +289,7 @@ struct AllocStats {
 /// Handle to the shared global state.
 static INJECTOR: OnceLock<GlobalStealer> = OnceLock::new();
 
-/// Enabled switch to turn on or off lgalloc. Off by default.
+/// Enabled switch to turn on or off hugalloc. Off by default.
 static LGALLOC_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable eager returning of memory. Off by default.
@@ -404,7 +404,7 @@ impl ThreadLocalStealer {
 
     /// Allocate a memory region from a specific size class.
     ///
-    /// Returns [`AllocError::Disabled`] if lgalloc is not enabled. Returns other error types
+    /// Returns [`AllocError::Disabled`] if hugalloc is not enabled. Returns other error types
     /// if out of memory, or an internal operation fails.
     fn allocate(&self, size_class: SizeClass) -> Result<Handle, AllocError> {
         if !LGALLOC_ENABLED.load(Ordering::Relaxed) {
@@ -633,7 +633,7 @@ fn mmap_anonymous(len: usize) -> Result<(usize, &'static mut [u8]), AllocError> 
         let ret = unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE) };
         if ret == -1 && !MADV_HUGEPAGE_WARNED.swap(true, Ordering::Relaxed) {
             eprintln!(
-                "lgalloc: MADV_HUGEPAGE failed: {}. Transparent huge pages may be disabled.",
+                "hugalloc: MADV_HUGEPAGE failed: {}. Transparent huge pages may be disabled.",
                 std::io::Error::last_os_error()
             );
         }
@@ -700,7 +700,7 @@ fn thread_context<R, F: FnOnce(&ThreadLocalStealer) -> R>(f: F) -> R {
 /// the alignment requirements of `T` cannot be fulfilled, if no more memory can be
 /// obtained from the system, or if any syscall fails.
 ///
-/// The function also returns an error if lgalloc is disabled.
+/// The function also returns an error if hugalloc is disabled.
 ///
 /// In the case of an error, no memory is allocated, and we maintain the internal
 /// invariants of the allocator.
@@ -840,9 +840,9 @@ impl BackgroundWorker {
     }
 }
 
-/// Set or update the configuration for lgalloc.
+/// Set or update the configuration for hugalloc.
 ///
-/// The function accepts a configuration, which is then applied on lgalloc. It allows clients to
+/// The function accepts a configuration, which is then applied on hugalloc. It allows clients to
 /// change the configuration of the background task.
 ///
 /// Updating the background thread configuration eventually applies the new configuration on the
@@ -850,7 +850,7 @@ impl BackgroundWorker {
 ///
 /// # Panics
 ///
-/// Panics if the internal state of lgalloc is corrupted.
+/// Panics if the internal state of hugalloc is corrupted.
 pub fn lgalloc_set_config(config: &LgAlloc) {
     let stealer = GlobalStealer::get_static();
 
@@ -885,7 +885,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
             let (sender, receiver) = std::sync::mpsc::channel();
             let mut worker = BackgroundWorker::new(receiver);
             let join_handle = std::thread::Builder::new()
-                .name("lgalloc-0".to_string())
+                .name("hugalloc-0".to_string())
                 .spawn(move || worker.run())
                 .expect("thread started successfully");
             sender.send(config).expect("Receiver exists");
@@ -894,7 +894,7 @@ pub fn lgalloc_set_config(config: &LgAlloc) {
     }
 }
 
-/// Configuration for lgalloc's background worker.
+/// Configuration for hugalloc's background worker.
 #[derive(Default, Debug, Clone, Eq, PartialEq)]
 pub struct BackgroundWorkerConfig {
     /// How frequently it should tick
@@ -925,13 +925,13 @@ impl LgAlloc {
         Self::default()
     }
 
-    /// Enable lgalloc globally.
+    /// Enable hugalloc globally.
     pub fn enable(&mut self) -> &mut Self {
         self.enabled = Some(true);
         self
     }
 
-    /// Disable lgalloc globally.
+    /// Disable hugalloc globally.
     pub fn disable(&mut self) -> &mut Self {
         self.enabled = Some(false);
         self
@@ -972,8 +972,8 @@ impl LgAlloc {
 ///
 /// # Panics
 ///
-/// Panics if the internal state of lgalloc is corrupted.
-pub fn lgalloc_stats() -> LgAllocStats {
+/// Panics if the internal state of hugalloc is corrupted.
+pub fn stats() -> Stats {
     let global = GlobalStealer::get_static();
 
     let mut size_class_stats = Vec::with_capacity(VALID_SIZE_CLASS.len());
@@ -984,14 +984,14 @@ pub fn lgalloc_stats() -> LgAllocStats {
         size_class_stats.push((size_class_bytes, SizeClassStats::from(state)));
     }
 
-    LgAllocStats {
+    Stats {
         size_class: size_class_stats,
     }
 }
 
-/// Statistics about lgalloc's internal behavior.
+/// Statistics about hugalloc's internal behavior.
 #[derive(Debug)]
-pub struct LgAllocStats {
+pub struct Stats {
     /// Per size-class statistics.
     pub size_class: Vec<(usize, SizeClassStats)>,
 }

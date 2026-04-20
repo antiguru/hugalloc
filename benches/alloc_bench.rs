@@ -1,4 +1,4 @@
-//! Benchmarks comparing lgalloc pooling vs direct mmap/munmap.
+//! Benchmarks comparing hugalloc pooling vs direct mmap/munmap.
 //!
 //! Measures allocation throughput and latency across thread counts.
 //!
@@ -38,13 +38,13 @@ fn main() {
     let total_mib: Option<usize> =
         parse_arg_value(&args, "--total-mib").and_then(|v| v.parse().ok());
 
-    // Initialize lgalloc once.
-    lgalloc::lgalloc_set_config(
-        lgalloc::LgAlloc::new()
+    // Initialize hugalloc once.
+    hugalloc::lgalloc_set_config(
+        hugalloc::LgAlloc::new()
             .enable()
             .growth_dampener(0)
             .eager_return(false)
-            .with_background_config(lgalloc::BackgroundWorkerConfig {
+            .with_background_config(hugalloc::BackgroundWorkerConfig {
                 interval: Duration::from_millis(100),
                 clear_bytes: 64 << 20,
             }),
@@ -63,8 +63,8 @@ fn main() {
     print_header();
 
     for &threads in THREAD_COUNTS {
-        run_bench("lgalloc", threads, bench_lgalloc);
-        run_bench("lgalloc+touch", threads, bench_lgalloc_touch);
+        run_bench("hugalloc", threads, bench_lgalloc);
+        run_bench("hugalloc+touch", threads, bench_lgalloc_touch);
         run_bench("sysalloc", threads, bench_sysalloc);
         run_bench("sysalloc+touch", threads, bench_sysalloc_touch);
         run_bench("sysalloc+nohuge", threads, bench_sysalloc_nohuge);
@@ -236,9 +236,9 @@ fn run_bench(name: &str, threads: usize, f: fn(&AtomicBool, &mut HdrHistogram<u6
 fn bench_lgalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
     while running.load(Ordering::Relaxed) {
         let start = Instant::now();
-        let (_ptr, _cap, handle) = lgalloc::allocate::<u8>(REGION_SIZE).unwrap();
+        let (_ptr, _cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
         black_box(&handle);
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
         let _ = hist.record(start.elapsed().as_nanos() as u64);
     }
 }
@@ -246,13 +246,13 @@ fn bench_lgalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
 fn bench_lgalloc_touch(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
     while running.load(Ordering::Relaxed) {
         let start = Instant::now();
-        let (ptr, cap, handle) = lgalloc::allocate::<u8>(REGION_SIZE).unwrap();
+        let (ptr, cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
         let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
         for i in (0..slice.len()).step_by(4096) {
             unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
         }
         black_box(slice);
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
         let _ = hist.record(start.elapsed().as_nanos() as u64);
     }
 }
@@ -706,7 +706,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
 
     // Phase 1: Allocate and touch everything to push into swap.
     let mut regions: Vec<_> = (0..num_regions)
-        .map(|_| lgalloc::allocate::<u8>(REGION_SIZE).unwrap())
+        .map(|_| hugalloc::allocate::<u8>(REGION_SIZE).unwrap())
         .collect();
 
     let touch_start = Instant::now();
@@ -852,7 +852,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
     // Phase 3: Dealloc half, realloc+touch (single thread, just one data point).
     let half = regions.len() / 2;
     for (_ptr, _cap, handle) in regions.drain(..half) {
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
     }
 
     {
@@ -865,13 +865,13 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
             let mut hist = SharedHistogram::recorder();
             while r2.load(Ordering::Relaxed) {
                 let start = Instant::now();
-                let (ptr, cap, h) = lgalloc::allocate::<u8>(REGION_SIZE).unwrap();
+                let (ptr, cap, h) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
                 let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
                 for i in (0..slice.len()).step_by(4096) {
                     unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
                 }
                 black_box(slice);
-                lgalloc::deallocate(h);
+                hugalloc::deallocate(h);
                 let _ = hist.record(start.elapsed().as_nanos() as u64);
             }
             sh2.merge(hist);
@@ -900,7 +900,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
 
     // Cleanup
     for (_ptr, _cap, handle) in regions.drain(..) {
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
     }
 }
 
@@ -919,10 +919,10 @@ fn bench_paging(total_mib: Option<usize>) {
         REGION_SIZE >> 20,
     );
 
-    // Phase 1: Allocate all regions via lgalloc.
+    // Phase 1: Allocate all regions via hugalloc.
     let alloc_start = Instant::now();
     let mut regions: Vec<_> = (0..num_regions)
-        .map(|_| lgalloc::allocate::<u8>(REGION_SIZE).unwrap())
+        .map(|_| hugalloc::allocate::<u8>(REGION_SIZE).unwrap())
         .collect();
     let alloc_elapsed = alloc_start.elapsed();
     println!(
@@ -1019,7 +1019,7 @@ fn bench_paging(total_mib: Option<usize>) {
 
     let half = regions.len() / 2;
     for (_ptr, _cap, handle) in regions.drain(..half) {
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -1031,13 +1031,13 @@ fn bench_paging(total_mib: Option<usize>) {
         let mut hist = SharedHistogram::recorder();
         while r2.load(Ordering::Relaxed) {
             let start = Instant::now();
-            let (ptr, cap, handle) = lgalloc::allocate::<u8>(REGION_SIZE).unwrap();
+            let (ptr, cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
             for i in (0..slice.len()).step_by(4096) {
                 unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
             }
             black_box(slice);
-            lgalloc::deallocate(handle);
+            hugalloc::deallocate(handle);
             let _ = hist.record(start.elapsed().as_nanos() as u64);
         }
         sh2.merge(hist);
@@ -1058,7 +1058,7 @@ fn bench_paging(total_mib: Option<usize>) {
 
     // Cleanup
     for (_ptr, _cap, handle) in regions.drain(..) {
-        lgalloc::deallocate(handle);
+        hugalloc::deallocate(handle);
     }
 }
 

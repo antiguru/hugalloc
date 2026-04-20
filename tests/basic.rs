@@ -2,8 +2,8 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use lgalloc::{
-    allocate, deallocate, lgalloc_set_config, lgalloc_stats, AllocError, BackgroundWorkerConfig,
+use hugalloc::{
+    allocate, deallocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
     Handle, LgAlloc,
 };
 
@@ -115,7 +115,7 @@ fn stats() -> Result<(), AllocError> {
     let (_ptr, _cap, handle) = allocate::<usize>(1 << 18)?;
     deallocate(handle);
 
-    let stats = lgalloc_stats();
+    let stats = hugalloc::stats();
 
     assert!(!stats.size_class.is_empty());
 
