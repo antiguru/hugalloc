@@ -9,7 +9,7 @@ repository = "https://github.com/antiguru/hugalloc"
 rust-version = "1.85"
 
 [dependencies]
-crossbeam-deque = "0.8.5"
+crossbeam-deque = "0.8.6"
 libc = "0.2"
 page_size = "0.6.0"
 thiserror = "2.0"
