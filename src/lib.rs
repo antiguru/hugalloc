@@ -118,15 +118,15 @@ impl Handle {
     ///
     /// # Errors
     ///
-    /// Returns [`PrefetchError::OutOfBounds`] if the byte range exceeds the allocation length.
-    pub fn prefetch<T>(&self, range: Range<usize>) -> Result<(), PrefetchError> {
+    /// Returns [`AdviseError::OutOfBounds`] if the byte range exceeds the allocation length.
+    pub fn prefetch<T>(&self, range: Range<usize>) -> Result<(), AdviseError> {
         let elem_size = std::mem::size_of::<T>();
         let byte_offset = range.start.checked_mul(elem_size);
         let byte_len = (range.end - range.start).checked_mul(elem_size);
         let (byte_offset, byte_len) = match (byte_offset, byte_len) {
             (Some(o), Some(l)) => (o, l),
             _ => {
-                return Err(PrefetchError::OutOfBounds {
+                return Err(AdviseError::OutOfBounds {
                     byte_offset: range.start.saturating_mul(elem_size),
                     byte_len: range.len().saturating_mul(elem_size),
                     allocation_len: self.len,
@@ -137,7 +137,7 @@ impl Handle {
             return Ok(());
         }
         if byte_offset.saturating_add(byte_len) > self.len {
-            return Err(PrefetchError::OutOfBounds {
+            return Err(AdviseError::OutOfBounds {
                 byte_offset,
                 byte_len,
                 allocation_len: self.len,
@@ -210,9 +210,9 @@ pub enum AllocError {
 
 /// Errors from [`Handle::prefetch`].
 #[derive(Error, Debug)]
-pub enum PrefetchError {
+pub enum AdviseError {
     /// The requested byte range exceeds the allocation.
-    #[error("prefetch byte range [{byte_offset}..{end}) exceeds allocation length {allocation_len}", end = byte_offset + byte_len)]
+    #[error("advise byte range [{byte_offset}..{end}) exceeds allocation length {allocation_len}", end = byte_offset + byte_len)]
     OutOfBounds {
         /// Byte offset of the requested range.
         byte_offset: usize,
