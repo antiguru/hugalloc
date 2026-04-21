@@ -1051,6 +1051,11 @@ impl Builder {
     }
 
     /// Minimum bytes of backlog to clear per tick per size class.
+    ///
+    /// This sets the floor: when `decay * backlog < floor`, the worker still
+    /// clears at least `floor` worth per tick. Set to 0 to rely entirely on
+    /// decay (and the internal ceiling-1 minimum that ensures at least one
+    /// region drains per tick when a backlog exists).
     pub fn background_clear_bytes(mut self, bytes: usize) -> Self {
         self.background_clear_bytes = Some(bytes);
         self
