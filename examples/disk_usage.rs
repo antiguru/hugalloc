@@ -33,7 +33,7 @@ fn main() {
 
     println!("Dropping regions");
     for (_ptr, _cap, handle) in regions.drain(..) {
-        hugalloc::deallocate(handle);
+        drop(handle);
     }
 
     println!("Enter to continue");

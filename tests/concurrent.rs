@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hugalloc::{
-    allocate, deallocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
+    allocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
     Handle, LgAlloc,
 };
 
@@ -45,7 +45,8 @@ impl<T> Wrapper<T> {
 
 impl<T> Drop for Wrapper<T> {
     fn drop(&mut self) {
-        unsafe { deallocate(self.handle.assume_init_read()) };
+        // SAFETY: the handle was initialized in `allocate`.
+        unsafe { self.handle.assume_init_drop() };
     }
 }
 

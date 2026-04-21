@@ -31,8 +31,8 @@ fn main() -> Result<(), hugalloc::AllocError> {
   // We can read from the vector.
   assert_eq!(&*vec, &[1, 2, 3, 4]);
 
-  // Deallocate after use
-  hugalloc::deallocate(handle);
+  // Deallocate after use — dropping the handle returns memory to the pool.
+  drop(handle);
 
   Ok(())
 }
@@ -57,7 +57,7 @@ Callers get a raw pointer, a capacity, and a handle; they are responsible for bu
   Callers must not lock pages (`mlock`) on regions managed by lgalloc, or must unlock them before returning the region.
   The background worker calls `madvise` on returned regions, which fails on locked pages.
 * **Do not free with another allocator.**
-  Memory obtained from `allocate` must be returned via `deallocate`.
+  Memory obtained from `allocate` must be returned by dropping the `Handle` or letting it go out of scope.
   Passing the pointer to `free`, `Vec::from_raw_parts` without `ManuallyDrop`, or any other allocator is undefined behavior.
 * **Minimum allocation is 2 MiB.**
   Size classes range from 2^21 (2 MiB) to 2^36 (64 GiB).

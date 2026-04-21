@@ -169,6 +169,22 @@ impl Handle {
     }
 }
 
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if self.is_dangling() {
+            return;
+        }
+        // Steal the fields into a fresh owned Handle and forward to the
+        // thread-local deallocation path. The original `self` is left in a
+        // dangling state so any (impossible) recursive drop is a no-op.
+        let taken = Handle {
+            ptr: std::mem::replace(&mut self.ptr, NonNull::dangling()),
+            len: std::mem::replace(&mut self.len, 0),
+        };
+        thread_context(|s| s.deallocate(taken));
+    }
+}
+
 /// Initial area size
 const INITIAL_SIZE: usize = 32 << 20;
 
@@ -692,7 +708,8 @@ fn thread_context<R, F: FnOnce(&ThreadLocalStealer) -> R>(f: F) -> R {
 /// Returns a pointer, a capacity in `T`, and a handle if successful, and an error
 /// otherwise. The capacity can be larger than requested.
 ///
-/// The memory must be freed using [`deallocate`], otherwise the memory leaks. The memory can be freed on a different thread.
+/// The returned [`Handle`] must be dropped or explicitly freed; dropping it returns the memory to
+/// the pool. The memory can be freed on a different thread.
 ///
 /// # Errors
 ///
@@ -737,22 +754,6 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
     }
     let actual_capacity = handle.len() / std::mem::size_of::<T>();
     Ok((ptr, actual_capacity, handle))
-}
-
-/// Free the memory referenced by `handle`, which has been obtained from [`allocate`].
-///
-/// This function cannot fail. The caller must not access the memory after freeing it. The caller is responsible
-/// for dropping/forgetting data.
-///
-/// # Panics
-///
-/// Panics if the thread local variable has been dropped, see [`std::thread::LocalKey`]
-/// for details.
-pub fn deallocate(handle: Handle) {
-    if handle.is_dangling() {
-        return;
-    }
-    thread_context(|s| s.deallocate(handle));
 }
 
 /// A background worker that performs periodic tasks.

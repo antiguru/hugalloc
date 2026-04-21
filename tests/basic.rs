@@ -3,7 +3,7 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use hugalloc::{
-    allocate, deallocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
+    allocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
     Handle, LgAlloc,
 };
 
@@ -43,7 +43,8 @@ impl<T> Wrapper<T> {
 
 impl<T> Drop for Wrapper<T> {
     fn drop(&mut self) {
-        unsafe { deallocate(self.handle.assume_init_read()) };
+        // SAFETY: the handle was initialized in `allocate`.
+        unsafe { self.handle.assume_init_drop() };
     }
 }
 
@@ -63,7 +64,7 @@ fn test_readme() -> Result<(), AllocError> {
     assert_eq!(&*vec, &[1, 2, 3, 4]);
 
     // Deallocate after use
-    deallocate(handle);
+    drop(handle);
     Ok(())
 }
 
@@ -113,7 +114,7 @@ fn zero_capacity_nonzst() -> Result<(), AllocError> {
 fn stats() -> Result<(), AllocError> {
     initialize();
     let (_ptr, _cap, handle) = allocate::<usize>(1 << 18)?;
-    deallocate(handle);
+    drop(handle);
 
     let stats = hugalloc::stats();
 
@@ -154,6 +155,32 @@ fn prefetch() -> Result<(), AllocError> {
     slice[0] = 42;
     assert_eq!(slice[0], 42);
 
-    deallocate(handle);
+    drop(handle);
     Ok(())
+}
+
+#[test]
+fn handle_drop_returns_to_pool() {
+    initialize();
+
+    let before = hugalloc::stats()
+        .size_class
+        .iter()
+        .map(|(_, s)| s.deallocations)
+        .sum::<u64>();
+
+    {
+        let (_, _, _handle) = hugalloc::allocate::<u8>(2 << 20).expect("allocate");
+        // Handle dropped at end of scope; should trigger pool return.
+    }
+
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let after = hugalloc::stats()
+        .size_class
+        .iter()
+        .map(|(_, s)| s.deallocations)
+        .sum::<u64>();
+
+    assert!(after > before, "expected deallocate count to increase after drop (before={before}, after={after})");
 }
