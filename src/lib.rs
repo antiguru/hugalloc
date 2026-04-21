@@ -413,7 +413,7 @@ struct GlobalStealer {
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
     /// Shared token to access background thread.
-    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundWorkerConfig>)>>,
+    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundConfigUpdate>)>>,
 }
 
 /// Per-size-class state
@@ -843,24 +843,51 @@ pub fn allocate<T>(capacity: usize) -> Result<(NonNull<T>, usize, Handle), Alloc
     Ok((ptr, actual_capacity, handle))
 }
 
+/// Full configuration the background worker holds. Not public.
+#[derive(Debug, Clone)]
+struct BackgroundWorkerConfig {
+    /// How frequently the worker ticks. `Duration::MAX` = effectively disabled.
+    interval: Duration,
+    /// Minimum bytes to clear per size class per tick.
+    clear_bytes: usize,
+    /// Decay factor for exponential backlog drain, in `[0.0, 1.0]`.
+    decay: f32,
+}
+
+impl Default for BackgroundWorkerConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::MAX,
+            clear_bytes: 0,
+            decay: 0.5,
+        }
+    }
+}
+
+/// Partial configuration sent over the config channel. The worker overlays
+/// `Some(_)` fields onto its current config and ignores `None` fields.
+/// Lets callers tweak one background knob without clobbering the others.
+#[derive(Default, Debug, Clone)]
+struct BackgroundConfigUpdate {
+    interval: Option<Duration>,
+    clear_bytes: Option<usize>,
+    decay: Option<f32>,
+}
+
 /// A background worker that performs periodic tasks.
 struct BackgroundWorker {
     config: BackgroundWorkerConfig,
-    receiver: Receiver<BackgroundWorkerConfig>,
+    receiver: Receiver<BackgroundConfigUpdate>,
     global_stealer: &'static GlobalStealer,
     worker: Worker<Handle>,
 }
 
 impl BackgroundWorker {
-    fn new(receiver: Receiver<BackgroundWorkerConfig>) -> Self {
-        let config = BackgroundWorkerConfig {
-            interval: Duration::MAX,
-            ..Default::default()
-        };
+    fn new(receiver: Receiver<BackgroundConfigUpdate>) -> Self {
         let global_stealer = GlobalStealer::get_static();
         let worker = Worker::new_fifo();
         Self {
-            config,
+            config: BackgroundWorkerConfig::default(),
             receiver,
             global_stealer,
             worker,
@@ -874,8 +901,16 @@ impl BackgroundWorker {
                 next_cleanup.saturating_duration_since(Instant::now())
             });
             match self.receiver.recv_timeout(timeout) {
-                Ok(config) => {
-                    self.config = config;
+                Ok(update) => {
+                    if let Some(i) = update.interval {
+                        self.config.interval = i;
+                    }
+                    if let Some(c) = update.clear_bytes {
+                        self.config.clear_bytes = c;
+                    }
+                    if let Some(d) = update.decay {
+                        self.config.decay = d;
+                    }
                     next_cleanup = None;
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -928,126 +963,170 @@ impl BackgroundWorker {
     }
 }
 
-/// Set or update the configuration for hugalloc.
+/// Fluent builder for hugalloc configuration.
 ///
-/// The function accepts a configuration, which is then applied on hugalloc. It allows clients to
-/// change the configuration of the background task.
-///
-/// Updating the background thread configuration eventually applies the new configuration on the
-/// running thread, or starts the background worker.
-///
-/// # Panics
-///
-/// Panics if the internal state of hugalloc is corrupted.
-pub fn lgalloc_set_config(config: &LgAlloc) {
+/// Constructed via [`builder()`]. Each setter consumes and returns `self`
+/// so the whole configuration reads as one expression. [`Builder::apply`]
+/// commits the configuration — only fields explicitly set via a setter are
+/// written to the global state; unset fields are preserved at their prior
+/// values.
+#[derive(Default, Clone)]
+pub struct Builder {
+    enabled: Option<bool>,
+    eager_return: Option<bool>,
+    growth_dampener: Option<usize>,
+    local_buffer_bytes: Option<usize>,
+    background_interval: Option<Duration>,
+    background_clear_bytes: Option<usize>,
+    background_decay: Option<f32>,
+}
+
+/// Begin configuring hugalloc. Terminate the chain with [`Builder::apply`].
+#[must_use]
+pub fn builder() -> Builder {
+    Builder::default()
+}
+
+impl Builder {
+    /// Set whether hugalloc is enabled.
+    pub fn enabled(mut self, yes: bool) -> Self {
+        self.enabled = Some(yes);
+        self
+    }
+
+    /// Shorthand for `.enabled(true)`.
+    pub fn enable(self) -> Self {
+        self.enabled(true)
+    }
+
+    /// Shorthand for `.enabled(false)`.
+    pub fn disable(self) -> Self {
+        self.enabled(false)
+    }
+
+    /// Whether to return physical memory on deallocate.
+    pub fn eager_return(mut self, yes: bool) -> Self {
+        self.eager_return = Some(yes);
+        self
+    }
+
+    /// Dampener in the area growth rate. `0` doubles; `n` grows by `1 + 1/(n+1)`.
+    pub fn growth_dampener(mut self, n: usize) -> Self {
+        self.growth_dampener = Some(n);
+        self
+    }
+
+    /// Size of the per-thread per-size class cache, in bytes.
+    pub fn local_buffer_bytes(mut self, bytes: usize) -> Self {
+        self.local_buffer_bytes = Some(bytes);
+        self
+    }
+
+    /// Background worker tick interval.
+    pub fn background_interval(mut self, d: Duration) -> Self {
+        self.background_interval = Some(d);
+        self
+    }
+
+    /// Minimum bytes of backlog to clear per tick per size class.
+    pub fn background_clear_bytes(mut self, bytes: usize) -> Self {
+        self.background_clear_bytes = Some(bytes);
+        self
+    }
+
+    /// Exponential decay factor for backlog drain.
+    ///
+    /// Higher values drain faster but cause more per-tick work. `0.5` halves
+    /// the backlog per tick beyond the floor. `0.0` disables acceleration
+    /// and falls back to the floor rate.
+    ///
+    /// Valid range is `[0.0, 1.0]`. Values outside this range are clamped
+    /// to the nearest boundary by [`Builder::apply`]; `NaN` is replaced by the
+    /// default (0.5).
+    pub fn background_decay(mut self, decay: f32) -> Self {
+        self.background_decay = Some(decay);
+        self
+    }
+
+    /// Commit the configuration to hugalloc's global state.
+    ///
+    /// Only fields explicitly set on the builder are written. Unset fields
+    /// preserve their prior values. This applies uniformly to both
+    /// top-level knobs (e.g. `enabled`, `growth_dampener`) and background
+    /// worker knobs (`background_interval`, `background_clear_bytes`,
+    /// `background_decay`) — the background worker receives a partial
+    /// update and overlays set fields onto its running configuration.
+    ///
+    /// The background worker thread is spawned lazily on the first
+    /// `apply()` call that includes any background-related knob. If no
+    /// background knob has ever been set, the worker never starts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::BackgroundWorkerFailed`] if the background
+    /// worker thread cannot be spawned.
+    pub fn apply(self) -> Result<(), ConfigError> {
+        apply_config(self)
+    }
+}
+
+fn apply_config(b: Builder) -> Result<(), ConfigError> {
     let stealer = GlobalStealer::get_static();
 
-    if let Some(enabled) = &config.enabled {
-        LGALLOC_ENABLED.store(*enabled, Ordering::Relaxed);
+    if let Some(enabled) = b.enabled {
+        LGALLOC_ENABLED.store(enabled, Ordering::Relaxed);
+    }
+    if let Some(eager_return) = b.eager_return {
+        LGALLOC_EAGER_RETURN.store(eager_return, Ordering::Relaxed);
+    }
+    if let Some(growth_dampener) = b.growth_dampener {
+        LGALLOC_GROWTH_DAMPENER.store(growth_dampener, Ordering::Relaxed);
+    }
+    if let Some(local_buffer_bytes) = b.local_buffer_bytes {
+        LOCAL_BUFFER_BYTES.store(local_buffer_bytes, Ordering::Relaxed);
     }
 
-    if let Some(eager_return) = &config.eager_return {
-        LGALLOC_EAGER_RETURN.store(*eager_return, Ordering::Relaxed);
+    let decay = b.background_decay.map(|d| {
+        if d.is_nan() { 0.5 } else { d.clamp(0.0, 1.0) }
+    });
+    let update = BackgroundConfigUpdate {
+        interval: b.background_interval,
+        clear_bytes: b.background_clear_bytes,
+        decay,
+    };
+    let any_background = update.interval.is_some()
+        || update.clear_bytes.is_some()
+        || update.decay.is_some();
+    if any_background {
+        send_background_update(stealer, update)?;
     }
+    Ok(())
+}
 
-    if let Some(growth_dampener) = &config.growth_dampener {
-        LGALLOC_GROWTH_DAMPENER.store(*growth_dampener, Ordering::Relaxed);
-    }
-
-    if let Some(local_buffer_bytes) = &config.local_buffer_bytes {
-        LOCAL_BUFFER_BYTES.store(*local_buffer_bytes, Ordering::Relaxed);
-    }
-
-    if let Some(config) = config.background_config.clone() {
-        let mut lock = stealer.background_sender.lock().expect("lock poisoned");
-
-        let config = if let Some((_, sender)) = &*lock {
-            match sender.send(config) {
-                Ok(()) => None,
-                Err(err) => Some(err.0),
-            }
-        } else {
-            Some(config)
-        };
-        if let Some(config) = config {
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let mut worker = BackgroundWorker::new(receiver);
-            let join_handle = std::thread::Builder::new()
-                .name("hugalloc-0".to_string())
-                .spawn(move || worker.run())
-                .expect("thread started successfully");
-            sender.send(config).expect("Receiver exists");
-            *lock = Some((join_handle, sender));
+fn send_background_update(
+    stealer: &'static GlobalStealer,
+    update: BackgroundConfigUpdate,
+) -> Result<(), ConfigError> {
+    let mut lock = stealer.background_sender.lock().expect("lock poisoned");
+    let leftover = if let Some((_, sender)) = &*lock {
+        match sender.send(update.clone()) {
+            Ok(()) => None,
+            Err(err) => Some(err.0),
         }
+    } else {
+        Some(update)
+    };
+    if let Some(update) = leftover {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut worker = BackgroundWorker::new(receiver);
+        let join_handle = std::thread::Builder::new()
+            .name("hugalloc-0".to_string())
+            .spawn(move || worker.run())
+            .map_err(ConfigError::BackgroundWorkerFailed)?;
+        sender.send(update).expect("Receiver exists");
+        *lock = Some((join_handle, sender));
     }
-}
-
-/// Configuration for hugalloc's background worker.
-#[derive(Default, Debug, Clone, Eq, PartialEq)]
-pub struct BackgroundWorkerConfig {
-    /// How frequently it should tick
-    pub interval: Duration,
-    /// How many bytes to clear per size class.
-    pub clear_bytes: usize,
-}
-
-/// hugalloc configuration
-#[derive(Default, Clone, Eq, PartialEq)]
-pub struct LgAlloc {
-    /// Whether the allocator is enabled or not.
-    pub enabled: Option<bool>,
-    /// Configuration of the background worker.
-    pub background_config: Option<BackgroundWorkerConfig>,
-    /// Whether to return physical memory on deallocate
-    pub eager_return: Option<bool>,
-    /// Dampener in the area growth rate. 0 corresponds to doubling and in general `n` to `1+1/(n+1)`.
-    pub growth_dampener: Option<usize>,
-    /// Size of the per-thread per-size class cache, in bytes.
-    pub local_buffer_bytes: Option<usize>,
-}
-
-impl LgAlloc {
-    /// Construct a new configuration. All values are initialized to their default (None) values.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Enable hugalloc globally.
-    pub fn enable(&mut self) -> &mut Self {
-        self.enabled = Some(true);
-        self
-    }
-
-    /// Disable hugalloc globally.
-    pub fn disable(&mut self) -> &mut Self {
-        self.enabled = Some(false);
-        self
-    }
-
-    /// Set the background worker configuration.
-    pub fn with_background_config(&mut self, config: BackgroundWorkerConfig) -> &mut Self {
-        self.background_config = Some(config);
-        self
-    }
-
-    /// Enable eager memory reclamation.
-    pub fn eager_return(&mut self, eager_return: bool) -> &mut Self {
-        self.eager_return = Some(eager_return);
-        self
-    }
-
-    /// Set the area growth dampener.
-    pub fn growth_dampener(&mut self, growth_dampener: usize) -> &mut Self {
-        self.growth_dampener = Some(growth_dampener);
-        self
-    }
-
-    /// Set the local buffer size.
-    pub fn local_buffer_bytes(&mut self, local_buffer_bytes: usize) -> &mut Self {
-        self.local_buffer_bytes = Some(local_buffer_bytes);
-        self
-    }
+    Ok(())
 }
 
 /// Determine global statistics per size class.

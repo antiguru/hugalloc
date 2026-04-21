@@ -15,10 +15,10 @@ lgalloc = "0.7"
 ```rust
 use std::mem::ManuallyDrop;
 fn main() -> Result<(), hugalloc::AllocError> {
-  hugalloc::lgalloc_set_config(
-    hugalloc::LgAlloc::new()
-      .enable(),
-  );
+  hugalloc::builder()
+    .enable()
+    .apply()
+    .expect("apply config");
 
   // Allocate memory
   let (ptr, cap, handle) = hugalloc::allocate::<u8>(2 << 20)?;

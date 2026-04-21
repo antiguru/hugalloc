@@ -4,21 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hugalloc::{
-    allocate, lgalloc_set_config, AllocError, BackgroundWorkerConfig,
-    Handle, LgAlloc,
-};
+use hugalloc::{allocate, AllocError, Handle};
 
 fn initialize() {
-    lgalloc_set_config(
-        LgAlloc::new()
-            .enable()
-            .with_background_config(BackgroundWorkerConfig {
-                interval: Duration::from_secs(1),
-                clear_bytes: 4 << 20,
-            })
-            .growth_dampener(1),
-    );
+    hugalloc::builder()
+        .enable()
+        .background_interval(Duration::from_secs(1))
+        .background_clear_bytes(4 << 20)
+        .growth_dampener(1)
+        .apply()
+        .expect("apply config");
 }
 
 struct Wrapper<T> {

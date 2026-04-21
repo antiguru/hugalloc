@@ -4,10 +4,11 @@ fn main() {
 
     let buffers = 32;
 
-    let mut config = hugalloc::LgAlloc::new();
-    config.enable();
-    config.eager_return(true);
-    hugalloc::lgalloc_set_config(&config);
+    hugalloc::builder()
+        .enable()
+        .eager_return(true)
+        .apply()
+        .expect("apply config");
 
     println!("Allocating {buffers} regions of {buffer_size} size...");
     let mut regions: Vec<_> = (0..32)

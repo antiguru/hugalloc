@@ -1,17 +1,14 @@
 use std::time::Duration;
-use hugalloc::{AdviseError, AllocError, BackgroundWorkerConfig, LgAlloc, lgalloc_set_config};
+use hugalloc::{AdviseError, AllocError};
 
-// TEMPORARY: the old config API is still in place until Task 9.
 fn initialize() {
-    lgalloc_set_config(
-        LgAlloc::new()
-            .enable()
-            .with_background_config(BackgroundWorkerConfig {
-                interval: Duration::from_secs(1),
-                clear_bytes: 4 << 20,
-            })
-            .growth_dampener(1),
-    );
+    hugalloc::builder()
+        .enable()
+        .background_interval(Duration::from_secs(1))
+        .background_clear_bytes(4 << 20)
+        .growth_dampener(1)
+        .apply()
+        .expect("apply config");
 }
 
 #[test]

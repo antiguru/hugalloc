@@ -1,7 +1,10 @@
-use hugalloc::{allocate, lgalloc_set_config, AllocError, LgAlloc};
+use hugalloc::{allocate, AllocError};
 
 #[test]
 fn disabled_allocator_returns_error() {
-    lgalloc_set_config(&*LgAlloc::new().disable());
+    hugalloc::builder()
+        .disable()
+        .apply()
+        .expect("apply config");
     assert!(matches!(allocate::<u8>(2 << 20), Err(AllocError::Disabled)));
 }

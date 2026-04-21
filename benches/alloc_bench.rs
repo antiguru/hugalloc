@@ -39,16 +39,14 @@ fn main() {
         parse_arg_value(&args, "--total-mib").and_then(|v| v.parse().ok());
 
     // Initialize hugalloc once.
-    hugalloc::lgalloc_set_config(
-        hugalloc::LgAlloc::new()
-            .enable()
-            .growth_dampener(0)
-            .eager_return(false)
-            .with_background_config(hugalloc::BackgroundWorkerConfig {
-                interval: Duration::from_millis(100),
-                clear_bytes: 64 << 20,
-            }),
-    );
+    hugalloc::builder()
+        .enable()
+        .growth_dampener(0)
+        .eager_return(false)
+        .background_interval(Duration::from_millis(100))
+        .background_clear_bytes(64 << 20)
+        .apply()
+        .expect("apply config");
 
     if run_ratio_sweep {
         bench_ratio_sweep(total_mib);
@@ -238,7 +236,7 @@ fn bench_hugalloc(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
         let start = Instant::now();
         let (_ptr, _cap, handle) = hugalloc::allocate::<u8>(REGION_SIZE).unwrap();
         black_box(&handle);
-        hugalloc::deallocate(handle);
+        drop(handle);
         let _ = hist.record(start.elapsed().as_nanos() as u64);
     }
 }
@@ -252,7 +250,7 @@ fn bench_hugalloc_touch(running: &AtomicBool, hist: &mut HdrHistogram<u64>) {
             unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
         }
         black_box(slice);
-        hugalloc::deallocate(handle);
+        drop(handle);
         let _ = hist.record(start.elapsed().as_nanos() as u64);
     }
 }
@@ -852,7 +850,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
     // Phase 3: Dealloc half, realloc+touch (single thread, just one data point).
     let half = regions.len() / 2;
     for (_ptr, _cap, handle) in regions.drain(..half) {
-        hugalloc::deallocate(handle);
+        drop(handle);
     }
 
     {
@@ -871,7 +869,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
                     unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
                 }
                 black_box(slice);
-                hugalloc::deallocate(h);
+                drop(h);
                 let _ = hist.record(start.elapsed().as_nanos() as u64);
             }
             sh2.merge(hist);
@@ -900,7 +898,7 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
 
     // Cleanup
     for (_ptr, _cap, handle) in regions.drain(..) {
-        hugalloc::deallocate(handle);
+        drop(handle);
     }
 }
 
@@ -1019,7 +1017,7 @@ fn bench_paging(total_mib: Option<usize>) {
 
     let half = regions.len() / 2;
     for (_ptr, _cap, handle) in regions.drain(..half) {
-        hugalloc::deallocate(handle);
+        drop(handle);
     }
 
     let running = Arc::new(AtomicBool::new(true));
@@ -1037,7 +1035,7 @@ fn bench_paging(total_mib: Option<usize>) {
                 unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
             }
             black_box(slice);
-            hugalloc::deallocate(handle);
+            drop(handle);
             let _ = hist.record(start.elapsed().as_nanos() as u64);
         }
         sh2.merge(hist);
@@ -1058,7 +1056,7 @@ fn bench_paging(total_mib: Option<usize>) {
 
     // Cleanup
     for (_ptr, _cap, handle) in regions.drain(..) {
-        hugalloc::deallocate(handle);
+        drop(handle);
     }
 }
 
