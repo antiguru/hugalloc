@@ -139,3 +139,13 @@ fn buffer_assume_init_roundtrip() {
     assert_eq!(buf[0], 0);
     assert_eq!(buf[63], 63);
 }
+
+#[test]
+fn rawbuffer_zero_capacity_is_not_lgalloc() {
+    initialize();
+    let raw: RawBuffer<u8> = RawBuffer::with_capacity(0);
+    // Zero-capacity allocations return a dangling handle; is_lgalloc should
+    // not lie and claim these are pool-backed.
+    assert!(!raw.is_lgalloc());
+    assert_eq!(raw.capacity(), 0);
+}

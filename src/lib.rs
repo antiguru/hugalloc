@@ -1355,8 +1355,11 @@ impl<T> RawBuffer<T> {
     }
 
     /// Whether the backing is an lgalloc handle (true) or a heap fallback (false).
+    ///
+    /// Returns `false` for zero-capacity allocations, which hold a dangling
+    /// handle rather than a real pool-backed region.
     pub fn is_lgalloc(&self) -> bool {
-        self.handle.is_some()
+        self.handle.as_ref().is_some_and(|h| !h.is_dangling())
     }
 
     /// View the buffer as a slice of `MaybeUninit<T>`.
