@@ -1088,6 +1088,13 @@ impl Builder {
     /// `apply()` call that includes any background-related knob. If no
     /// background knob has ever been set, the worker never starts.
     ///
+    /// # Atomicity
+    ///
+    /// Individual fields are written with separate atomic stores (relaxed).
+    /// The background worker may observe a mix of old and new values for
+    /// one tick; subsequent ticks see the fully-updated configuration. This
+    /// matches `lgalloc` 0.7 behavior.
+    ///
     /// # Errors
     ///
     /// Returns [`ConfigError::BackgroundWorkerFailed`] if the background
