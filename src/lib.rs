@@ -311,6 +311,13 @@ const MADV_PAGEOUT_STRATEGY: libc::c_int = -1;
 #[cfg(target_os = "linux")]
 static MADV_HUGEPAGE_WARNED: AtomicBool = AtomicBool::new(false);
 
+/// Whether we have already warned about a `mem.clear()` failure.
+///
+/// Emits one warning to stderr on the first failure, then stays silent for the
+/// remainder of the worker's lifetime. This prevents log spam on repeated
+/// madvise errors while still surfacing the problem once.
+static CLEAR_FAILED_WARNED: AtomicBool = AtomicBool::new(false);
+
 type PhantomUnsyncUnsend<T> = PhantomData<*mut T>;
 
 /// Allocation errors
@@ -994,7 +1001,11 @@ impl BackgroundWorker {
             while let Some(mut mem) = worker.pop() {
                 match mem.clear() {
                     Ok(()) => count += 1,
-                    Err(e) => panic!("Syscall failed: {e:?}"),
+                    Err(e) => {
+                        if !CLEAR_FAILED_WARNED.swap(true, Ordering::Relaxed) {
+                            eprintln!("hugalloc: background clear failed: {e}. Continuing; the region still returns to the clean injector with its prior content.");
+                        }
+                    }
                 }
                 state.clean_injector.push(mem);
                 limit -= 1;
