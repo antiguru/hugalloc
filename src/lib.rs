@@ -74,6 +74,12 @@ pub struct Handle {
     ptr: NonNull<u8>,
     /// Length of the allocation.
     len: usize,
+    /// "Tainted" bit: set by [`Handle::pageout`], cleared by
+    /// [`Handle::restore_thp`]. If set when the handle drops, the allocator
+    /// replaces the mapping via `MAP_FIXED` before recycling the region, so
+    /// the next caller gets a clean PMD rather than a post-pageout 4 KiB
+    /// subtable. See <https://github.com/antiguru/hugalloc/issues/1>.
+    tainted: AtomicBool,
 }
 
 unsafe impl Send for Handle {}
@@ -83,7 +89,11 @@ unsafe impl Sync for Handle {}
 impl Handle {
     /// Construct a new handle from a region of memory
     fn new(ptr: NonNull<u8>, len: usize) -> Self {
-        Self { ptr, len }
+        Self {
+            ptr,
+            len,
+            tainted: AtomicBool::new(false),
+        }
     }
 
     /// Construct a dangling handle, which is only suitable for zero-sized types.
@@ -91,6 +101,7 @@ impl Handle {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
+            tainted: AtomicBool::new(false),
         }
     }
 
@@ -211,28 +222,36 @@ impl Handle {
     ///
     /// ## Interaction with the allocator pool
     ///
-    /// Paging out a region does not remove it from the pool. If you deallocate
-    /// a pageout'd region, the pool hands its cold, non-resident backing to the
-    /// next caller — writes to that region will fault and pay kernel page-in
-    /// cost, and the region's PMDs stay split at 4 KiB regardless of the
-    /// `MADV_HUGEPAGE` hint. The pool does not guarantee resident memory or
-    /// THP backing across hand-offs.
-    /// See <https://github.com/antiguru/hugalloc/issues/1>.
+    /// `pageout` marks the handle as "tainted." When a tainted handle drops,
+    /// the allocator replaces its mapping via `MAP_FIXED` before recycling
+    /// it, so the next caller gets a fresh PMD rather than inheriting the
+    /// 4 KiB split + staged swap entries the pageout left behind. The pool
+    /// therefore preserves its zero-overhead recycle path for the
+    /// common (untainted) case, and pays one extra `mmap` syscall only on
+    /// deallocation of regions the caller actually pageout'd.
+    /// See <https://github.com/antiguru/hugalloc/issues/1> and `BENCH.md`'s
+    /// "Pageout / recycle investigation" for measurements.
     ///
-    /// ## Recovering THP after `pageout`
+    /// ## Recovering THP on the same handle
     ///
-    /// If the same handle is re-used after `pageout`, call
-    /// [`Handle::restore_thp`] to fault the pages back in and re-coalesce
-    /// the PMDs. A plain re-touch will find the pages (fast, if they never
-    /// actually evicted; slow, if they did), but `restore_thp` also issues
-    /// `MADV_COLLAPSE` so the range ends up THP-backed.
+    /// If the caller keeps the handle and wants THP backing restored in
+    /// place (without recycling), call [`Handle::restore_thp`]. That clears
+    /// the tainted bit and brings the range back to THP via
+    /// `MADV_WILLNEED` + `MADV_POPULATE_READ` + `MADV_COLLAPSE`.
     ///
     /// # Errors
     ///
     /// Returns [`AdviseError::OutOfBounds`] if `byte_range.end` exceeds the
     /// allocation length.
     pub fn pageout(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
-        self.advise_range(byte_range, MADV_PAGEOUT_STRATEGY)
+        self.advise_range(byte_range, MADV_PAGEOUT_STRATEGY)?;
+        // Mark the handle tainted so `Drop` knows to `MAP_FIXED`-remap this
+        // region before recycling it into the pool. On non-Linux this is
+        // still correct but wasteful — `MADV_PAGEOUT_STRATEGY` was a no-op
+        // there, so the region is no different from untainted; the
+        // subsequent remap on drop is then redundant but not incorrect.
+        self.tainted.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Restore transparent huge page backing over a byte range after a prior
@@ -268,13 +287,25 @@ impl Handle {
     pub fn restore_thp(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_range(byte_range.clone(), libc::MADV_WILLNEED)?;
         self.advise_range(byte_range.clone(), MADV_POPULATE_READ_STRATEGY)?;
-        self.advise_range(byte_range, MADV_COLLAPSE_STRATEGY)
+        self.advise_range(byte_range, MADV_COLLAPSE_STRATEGY)?;
+        // Restore brought THP back; clear the tainted bit so `Drop` doesn't
+        // needlessly remap a region the caller just fixed.
+        self.tainted.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Consume the handle and return its raw components. The caller becomes
     /// responsible for the allocation and must reconstruct via
     /// [`Handle::from_raw_parts`] to release it, or leak the memory
     /// permanently via [`std::mem::forget`].
+    ///
+    /// Note: the handle's tainted state (set by [`Handle::pageout`]) is not
+    /// preserved across `into_raw_parts` / `from_raw_parts`. A tainted
+    /// handle that round-trips through the raw-parts API will drop as if it
+    /// were untainted, so the PMD-split region recycles without being
+    /// remapped. If you want the mitigation to apply, either don't round
+    /// through `into_raw_parts`, or call [`Handle::restore_thp`] before
+    /// `into_raw_parts`.
     pub fn into_raw_parts(self) -> (NonNull<u8>, usize) {
         let parts = (self.ptr, self.len);
         std::mem::forget(self);
@@ -284,6 +315,9 @@ impl Handle {
     /// Reconstruct a `Handle` from a pointer and length previously returned
     /// by [`Handle::into_raw_parts`].
     ///
+    /// The reconstructed handle always starts untainted. See
+    /// [`Handle::into_raw_parts`] for what that implies.
+    ///
     /// # Safety
     ///
     /// - `ptr` and `len` must have come from a prior call to
@@ -292,7 +326,11 @@ impl Handle {
     /// - Calling `from_raw_parts` twice on the same pair of values without
     ///   an intervening deallocate produces aliasing and is undefined behavior.
     pub unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
-        Self { ptr, len }
+        Self {
+            ptr,
+            len,
+            tainted: AtomicBool::new(false),
+        }
     }
 
     /// Call `madvise` on the memory region. Unsafe because `advice` is passed verbatim.
@@ -317,15 +355,67 @@ impl Drop for Handle {
         if self.is_dangling() {
             return;
         }
+        // If the caller pageout'd this handle without restoring THP, replace
+        // the mapping with a fresh one so the next caller gets a clean PMD
+        // instead of inheriting the 4 KiB split + staged swap entries. Best
+        // effort: if the remap fails, the region still recycles with its
+        // current state (same as status quo before this mitigation).
+        if self.tainted.load(Ordering::Relaxed) {
+            let _ = remap_in_place(self.ptr, self.len);
+        }
         // Steal the fields into a fresh owned Handle and forward to the
         // thread-local deallocation path. The original `self` is left in a
-        // dangling state so any (impossible) recursive drop is a no-op.
+        // dangling state so any (impossible) recursive drop is a no-op. The
+        // new Handle starts untainted regardless of self's prior state — the
+        // remap above (if it ran) cleaned the region.
         let taken = Handle {
             ptr: std::mem::replace(&mut self.ptr, NonNull::dangling()),
             len: std::mem::replace(&mut self.len, 0),
+            tainted: AtomicBool::new(false),
         };
         thread_context(|s| s.deallocate(taken));
     }
+}
+
+/// Replace the existing `MAP_PRIVATE|MAP_ANONYMOUS` mapping at
+/// `ptr..ptr+len` with a fresh one via `MAP_FIXED`, then re-apply
+/// `MADV_HUGEPAGE`.
+///
+/// This is the remediation path for regions tainted by
+/// [`Handle::pageout`]. `MAP_FIXED` atomically replaces the old mapping's
+/// page tables, discarding whatever split-PMD or swap-entry state
+/// `MADV_PAGEOUT` installed. The next caller's first touch then takes the
+/// fresh anon fault-in path and (with `MADV_HUGEPAGE` on the replacement
+/// VMA) gets PMD-order backing again. See `BENCH.md`'s "Pageout / recycle
+/// investigation" for measurements.
+///
+/// # Safety
+///
+/// Caller must vouch that `ptr..ptr+len` is a live mapping it owns and
+/// that replacing it is safe — in particular, no other code holds a
+/// reference to the contents across the replacement.
+fn remap_in_place(ptr: NonNull<u8>, len: usize) -> std::io::Result<()> {
+    // SAFETY: See function-level comment; caller's invariant.
+    let ret = unsafe {
+        libc::mmap(
+            ptr.as_ptr().cast(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    if ret == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Re-apply the THP hint. The replacement VMA has default attributes.
+    #[cfg(target_os = "linux")]
+    // SAFETY: ptr..ptr+len is now a fresh mapping per the mmap above.
+    unsafe {
+        libc::madvise(ptr.as_ptr().cast(), len, libc::MADV_HUGEPAGE);
+    }
+    Ok(())
 }
 
 /// Initial area size
