@@ -126,7 +126,12 @@ impl Handle {
         // SAFETY: advisory hint, ptr in-bounds by check above.
         unsafe {
             let ptr = self.as_non_null().as_ptr().add(byte_offset);
-            libc::madvise(ptr.cast(), byte_len, advice);
+            // MADV_WILLNEED is portable; MADV_COLD / MADV_PAGEOUT are Linux-only.
+            // On non-Linux, MADV_COLD_STRATEGY / MADV_PAGEOUT_STRATEGY are -1 and
+            // must not be passed to the kernel.
+            if advice != -1 {
+                libc::madvise(ptr.cast(), byte_len, advice);
+            }
         }
         Ok(())
     }
@@ -148,6 +153,46 @@ impl Handle {
     /// allocation length.
     pub fn prefetch(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_range(byte_range, libc::MADV_WILLNEED)
+    }
+
+    /// Hint that a byte range is unlikely to be accessed soon.
+    ///
+    /// Issues `MADV_COLD` on Linux (silent no-op on other platforms). Pages
+    /// remain mapped and populated but become preferred eviction candidates
+    /// under memory pressure. Cheap.
+    ///
+    /// On a transparent huge page, the kernel may split the page down to 4
+    /// KiB granularity to operate on a sub-range. Splits are not
+    /// automatically reversed.
+    ///
+    /// This is a performance hint and never affects correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdviseError::OutOfBounds`] if `byte_range.end` exceeds the
+    /// allocation length.
+    pub fn cold(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_range(byte_range, MADV_COLD_STRATEGY)
+    }
+
+    /// Request immediate eviction of a byte range.
+    ///
+    /// Issues `MADV_PAGEOUT` on Linux (silent no-op on other platforms). On
+    /// anonymous pages this requires swap to be configured; without swap
+    /// the kernel cannot evict anonymous memory and the call has no useful
+    /// effect.
+    ///
+    /// Expensive — issues syscalls synchronously and may cause the kernel to
+    /// split transparent huge pages.
+    ///
+    /// This is a performance hint and never affects correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdviseError::OutOfBounds`] if `byte_range.end` exceeds the
+    /// allocation length.
+    pub fn pageout(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_range(byte_range, MADV_PAGEOUT_STRATEGY)
     }
 
     /// Consume the handle and return its raw components. The caller becomes
@@ -220,6 +265,18 @@ const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_FREE;
 #[cfg(not(target_os = "linux"))]
 const MADV_CLEAR_STRATEGY: libc::c_int = libc::MADV_DONTNEED;
 
+/// Linux-only "mark as cold" advice; `-1` sentinel on other platforms (never passed to kernel).
+#[cfg(target_os = "linux")]
+const MADV_COLD_STRATEGY: libc::c_int = libc::MADV_COLD;
+#[cfg(not(target_os = "linux"))]
+const MADV_COLD_STRATEGY: libc::c_int = -1;
+
+/// Linux-only "page out" advice; `-1` sentinel on other platforms (never passed to kernel).
+#[cfg(target_os = "linux")]
+const MADV_PAGEOUT_STRATEGY: libc::c_int = libc::MADV_PAGEOUT;
+#[cfg(not(target_os = "linux"))]
+const MADV_PAGEOUT_STRATEGY: libc::c_int = -1;
+
 /// Whether we have already warned about `MADV_HUGEPAGE` failure.
 #[cfg(target_os = "linux")]
 static MADV_HUGEPAGE_WARNED: AtomicBool = AtomicBool::new(false);
@@ -246,7 +303,7 @@ pub enum AllocError {
     UnalignedMemory,
 }
 
-/// Errors from [`Handle::prefetch`].
+/// Errors from [`Handle::prefetch`], [`Handle::cold`], and [`Handle::pageout`].
 #[derive(Error, Debug)]
 pub enum AdviseError {
     /// The requested byte range exceeds the allocation.
