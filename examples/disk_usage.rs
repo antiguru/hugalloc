@@ -49,8 +49,12 @@ fn print_stats() {
         if stats.areas > 0 {
             println!(
                 "size_class {size_class}: areas={}, total_bytes={}, free={}, clean={}, global={}, thread={}",
-                stats.areas, stats.area_total_bytes, stats.free_regions, stats.clean_regions,
-                stats.global_regions, stats.thread_regions,
+                stats.areas,
+                stats.area_total_bytes,
+                stats.free_regions,
+                stats.clean_regions,
+                stats.global_regions,
+                stats.thread_regions,
             );
         }
     }

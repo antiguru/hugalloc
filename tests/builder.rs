@@ -1,7 +1,7 @@
-use std::sync::Mutex;
-use std::time::Duration;
 use hugalloc::ConfigError;
 use hugalloc::stats;
+use std::sync::Mutex;
+use std::time::Duration;
 
 /// Serializes tests that write to the global hugalloc configuration or rely on
 /// the background-worker tick rate, which is process-global state.
@@ -49,9 +49,9 @@ fn background_decay_drains_backlog() {
     // Configure short ticks, small floor, full decay.
     hugalloc::builder()
         .enable()
-        .local_buffer_bytes(1 << 21)  // force overflow into global injector
+        .local_buffer_bytes(1 << 21) // force overflow into global injector
         .background_interval(Duration::from_millis(50))
-        .background_clear_bytes(1 << 21)   // 1 region at min size class
+        .background_clear_bytes(1 << 21) // 1 region at min size class
         .background_decay(0.5)
         .apply()
         .expect("apply");
@@ -90,11 +90,11 @@ fn background_floor_matches_flat() {
     // We use a large floor (many regions) and count clean_slow_total before
     // and after a fixed number of ticks. With decay=0, the total cleaned must
     // equal floor_regions * ticks, not backlog * decay * ticks.
-    const FLOOR_BYTES: usize = 1 << 21;        // 2 MiB floor = 1 region per tick
+    const FLOOR_BYTES: usize = 1 << 21; // 2 MiB floor = 1 region per tick
     const TICK_MS: u64 = 50;
     hugalloc::builder()
         .enable()
-        .local_buffer_bytes(1 << 21)  // force overflow into global injector
+        .local_buffer_bytes(1 << 21) // force overflow into global injector
         .background_interval(Duration::from_millis(TICK_MS))
         .background_clear_bytes(FLOOR_BYTES)
         .background_decay(0.0)
@@ -136,7 +136,10 @@ fn builder_full_apply() -> Result<(), ConfigError> {
     let _g = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Verify each knob's effect is observable, not just that the chain compiles.
     hugalloc::builder().disable().apply()?;
-    assert!(matches!(hugalloc::allocate::<u8>(2 << 20), Err(hugalloc::AllocError::Disabled)));
+    assert!(matches!(
+        hugalloc::allocate::<u8>(2 << 20),
+        Err(hugalloc::AllocError::Disabled)
+    ));
 
     hugalloc::builder().enable().apply()?;
     let (_, _, h) = hugalloc::allocate::<u8>(2 << 20).expect("enable takes effect");
@@ -175,7 +178,11 @@ fn background_respawn_preserves_prior_config() -> Result<(), ConfigError> {
     std::thread::sleep(Duration::from_millis(500));
 
     let s = hugalloc::stats();
-    let backlog: usize = s.size_class.iter().map(|(_, stat)| stat.global_regions).sum();
+    let backlog: usize = s
+        .size_class
+        .iter()
+        .map(|(_, stat)| stat.global_regions)
+        .sum();
     assert!(
         backlog <= 2,
         "backlog still {backlog} after decay-only reconfigure; last_config not preserved"

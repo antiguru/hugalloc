@@ -1,4 +1,4 @@
-use hugalloc::{AdviseError, RawBuffer, Buffer};
+use hugalloc::{AdviseError, Buffer, RawBuffer};
 
 fn initialize() {
     hugalloc::builder()

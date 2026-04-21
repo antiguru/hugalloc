@@ -1,10 +1,10 @@
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use hugalloc::{allocate, AllocError, Handle};
+use hugalloc::{AllocError, Handle, allocate};
 
 fn initialize() {
     hugalloc::builder()

@@ -1,5 +1,5 @@
-use std::time::Duration;
 use hugalloc::{AdviseError, AllocError};
+use std::time::Duration;
 
 fn initialize() {
     hugalloc::builder()
@@ -17,7 +17,10 @@ fn handle_cold_ok() -> Result<(), AllocError> {
     let (_, cap, handle) = hugalloc::allocate::<u8>(2 << 20)?;
     handle.cold(0..cap).unwrap();
     handle.cold(0..0).unwrap();
-    assert!(matches!(handle.cold(0..cap + 1), Err(AdviseError::OutOfBounds { .. })));
+    assert!(matches!(
+        handle.cold(0..cap + 1),
+        Err(AdviseError::OutOfBounds { .. })
+    ));
     Ok(())
 }
 
@@ -27,7 +30,10 @@ fn handle_pageout_ok() -> Result<(), AllocError> {
     let (_, cap, handle) = hugalloc::allocate::<u8>(2 << 20)?;
     handle.pageout(0..cap).unwrap();
     handle.pageout(0..0).unwrap();
-    assert!(matches!(handle.pageout(0..cap + 1), Err(AdviseError::OutOfBounds { .. })));
+    assert!(matches!(
+        handle.pageout(0..cap + 1),
+        Err(AdviseError::OutOfBounds { .. })
+    ));
     Ok(())
 }
 

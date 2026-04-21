@@ -2,7 +2,7 @@ use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ptr::NonNull;
 use std::time::Duration;
 
-use hugalloc::{allocate, AllocError, Handle};
+use hugalloc::{AllocError, Handle, allocate};
 
 fn initialize() {
     hugalloc::builder()
@@ -72,10 +72,7 @@ fn allocate_and_write() -> Result<(), AllocError> {
 
 #[test]
 fn cross_thread_dealloc() -> Result<(), AllocError> {
-    hugalloc::builder()
-        .enable()
-        .apply()
-        .expect("apply config");
+    hugalloc::builder().enable().apply().expect("apply config");
     let r = <Wrapper<u8>>::allocate(2 << 20)?;
 
     let thread = std::thread::spawn(move || drop(r));
