@@ -1385,6 +1385,67 @@ impl<T> RawBuffer<T> {
         );
         Buffer { raw: self, len }
     }
+
+    /// Prefetch the byte range covered by the given element range.
+    ///
+    /// Element offsets are converted to byte offsets via
+    /// `checked_mul(size_of::<T>())`. On overflow, returns
+    /// `AdviseError::OutOfBounds` with saturating byte values.
+    pub fn prefetch(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, libc::MADV_WILLNEED)
+    }
+
+    /// Mark a byte range as cold. See [`Handle::cold`].
+    pub fn cold(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, MADV_COLD_STRATEGY)
+    }
+
+    /// Request eviction of a byte range. See [`Handle::pageout`].
+    pub fn pageout(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
+    }
+
+    fn advise_element_range(
+        &self,
+        range: Range<usize>,
+        advice: libc::c_int,
+    ) -> Result<(), AdviseError> {
+        let elem_size = std::mem::size_of::<T>();
+        let byte_offset = range.start.checked_mul(elem_size);
+        let byte_len = range
+            .end
+            .checked_sub(range.start)
+            .and_then(|n| n.checked_mul(elem_size));
+        let (byte_offset, byte_len) = match (byte_offset, byte_len) {
+            (Some(o), Some(l)) => (o, l),
+            _ => {
+                let allocation_len = self.capacity.saturating_mul(elem_size);
+                return Err(AdviseError::OutOfBounds {
+                    byte_offset: range.start.saturating_mul(elem_size),
+                    byte_len: range.end.saturating_mul(elem_size).saturating_sub(
+                        range.start.saturating_mul(elem_size),
+                    ),
+                    allocation_len,
+                });
+            }
+        };
+        match &self.handle {
+            Some(h) => h.advise_range(byte_offset..byte_offset + byte_len, advice),
+            None => {
+                // Heap-backed: bounds-check against capacity in bytes; no madvise call.
+                let allocation_len = self.capacity.saturating_mul(elem_size);
+                if byte_offset.saturating_add(byte_len) > allocation_len {
+                    Err(AdviseError::OutOfBounds {
+                        byte_offset,
+                        byte_len,
+                        allocation_len,
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 impl<T> Drop for RawBuffer<T> {
@@ -1518,6 +1579,38 @@ impl<T> Buffer<T> {
         let raw = unsafe { std::ptr::read(&self.raw) };
         std::mem::forget(self);
         (raw, len)
+    }
+
+    /// See [`RawBuffer::prefetch`]. Bounds are against `len`, not `capacity`.
+    pub fn prefetch(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, libc::MADV_WILLNEED)
+    }
+
+    /// See [`RawBuffer::cold`]. Bounds are against `len`, not `capacity`.
+    pub fn cold(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, MADV_COLD_STRATEGY)
+    }
+
+    /// See [`RawBuffer::pageout`]. Bounds are against `len`, not `capacity`.
+    pub fn pageout(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
+    }
+
+    fn advise_element_range(
+        &self,
+        range: Range<usize>,
+        advice: libc::c_int,
+    ) -> Result<(), AdviseError> {
+        // Bounds check against len; anything beyond is always out of bounds for Buffer.
+        if range.end > self.len {
+            let elem_size = std::mem::size_of::<T>();
+            return Err(AdviseError::OutOfBounds {
+                byte_offset: range.start.saturating_mul(elem_size),
+                byte_len: (range.end.saturating_sub(range.start)).saturating_mul(elem_size),
+                allocation_len: self.len.saturating_mul(elem_size),
+            });
+        }
+        self.raw.advise_element_range(range, advice)
     }
 }
 
