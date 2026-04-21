@@ -231,6 +231,7 @@ BENCH=$(ls -t target/release/deps/pageout_bench-* | grep -v '\.d$' | head -1)
 "$BENCH" --swap-probe       # experiment 6 (THP through swap)
 "$BENCH" --split-recovery   # experiment 7 (can a split PMD be coalesced?)
 "$BENCH" --collapse-probe   # experiment 8 (COLLAPSE on paged data)
+"$BENCH" --recovery         # experiment 9 (recovery path costs)
 ```
 
 Experiments that need a cgroup memory limit to be meaningful:
@@ -239,8 +240,11 @@ Experiments that need a cgroup memory limit to be meaningful:
 # experiment 4 (advisory + pressure)
 systemd-run --user -p MemoryMax=512M -p MemorySwapMax=4G --wait --pipe "$BENCH" --pressure
 
-# experiment 8 scenario C / C2 (COLLAPSE after real eviction)
+# experiment 8 scenarios C / C2 (COLLAPSE after real eviction)
 systemd-run --user -p MemoryMax=512M -p MemorySwapMax=4G --wait --pipe "$BENCH" --collapse-probe
+
+# experiment 9 under pressure (recovery cost when pages are truly evicted)
+systemd-run --user -p MemoryMax=512M -p MemorySwapMax=4G --wait --pipe "$BENCH" --recovery
 ```
 
 ### Experiment 1: baseline first-touch
@@ -493,6 +497,62 @@ Findings under a 512 MiB cgroup (4 GiB swap):
 * **Cost envelope:** for a 2 MiB region, retouch-from-swap + COLLAPSE is ~709 µs — about 15× a fresh THP fault (~47 µs). For 128 MiB: ~35.64 ms vs 2.92 ms baseline. A `munmap` + fresh `mmap` + first-touch path would be cheaper for truly-evicted regions because it skips the swap-in entirely.
 * **Edge case (1 GiB under 512 MiB cgroup):** retouch can't fully re-populate a 1 GiB region in a 512 MiB budget; the kernel evicts as fast as we fault in. COLLAPSE then returns `EAGAIN` with only partial THP coverage (~33%). This is a kernel policy choice — COLLAPSE won't evict other memory to make room for a THP.
 
+### Experiment 9: recovery path costs
+
+Given experiments 7 and 8 established the set of primitives that can restore THP (COLLAPSE after a touch, or a fresh mapping), this experiment puts end-to-end wall-time numbers on each candidate recovery path, so we can see the cost envelope of each strategy a mitigation could choose.
+
+Setup per rep: `Probe::new` → populate → `MADV_PAGEOUT`, optionally followed by a dirty pressure buffer sized to ~1.5× the cgroup's `memory.max` (which forces the pages to actually evict to swap, not just stage). Recovery sequence is then timed end-to-end.
+
+```sh
+BENCH=$(ls -t target/release/deps/pageout_bench-* | grep -v '\.d$' | head -1)
+"$BENCH" --recovery                                        # idle regime (pages still mapped)
+systemd-run --user -p MemoryMax=512M -p MemorySwapMax=4G \
+  --wait --pipe "$BENCH" --recovery                        # pressure regime (real eviction)
+```
+
+#### Pressure regime (cgroup = 512 MiB, pages truly in swap)
+
+| size   | path                               | time_med | time_p99 | res%   | thp%   |
+|--------|------------------------------------|----------|----------|--------|--------|
+|  2 MiB | touch only (bug baseline)          |  5.65 ms |  5.90 ms | 100%   |    0%  |
+|  2 MiB | touch + `COLLAPSE`                 |  6.47 ms |  8.68 ms | 100%   |  100%  |
+|  2 MiB | `WILLNEED` + touch                 |  1.49 ms |  1.54 ms | 100%   |    0%  |
+|  2 MiB | `WILLNEED` + touch + `COLLAPSE`    |  2.13 ms |  2.23 ms | 100%   |  100%  |
+|  2 MiB | **`MAP_FIXED` remap + touch**      | **107.1 µs** | 107.1 µs | 100%   | **100%** |
+| 16 MiB | touch only (bug baseline)          | 51.92 ms | 53.28 ms | 100%   |    0%  |
+| 16 MiB | touch + `COLLAPSE`                 | 57.29 ms | 58.30 ms | 100%   |  100%  |
+| 16 MiB | `WILLNEED` + touch                 | 11.43 ms | 11.94 ms | 100%   |    0%  |
+| 16 MiB | `WILLNEED` + touch + `COLLAPSE`    | 16.81 ms | 18.07 ms | 100%   |  100%  |
+| 16 MiB | **`MAP_FIXED` remap + touch**      | **696.8 µs** | 712.7 µs | 100%   | **100%** |
+|128 MiB | touch only (bug baseline)          |421.21 ms |424.76 ms | 100%   |    0%  |
+|128 MiB | touch + `COLLAPSE`                 |459.01 ms |464.44 ms | 100%   |  100%  |
+|128 MiB | `WILLNEED` + touch                 | 86.16 ms | 87.37 ms | 100%   |    0%  |
+|128 MiB | `WILLNEED` + touch + `COLLAPSE`    |121.70 ms |125.57 ms | 100%   |  100%  |
+|128 MiB | **`MAP_FIXED` remap + touch**      |**5.64 ms**| 5.87 ms | 100%   | **100%** |
+
+#### Idle regime (no cgroup, pages stay mapped despite PAGEOUT)
+
+| size   | path                               | time_med | time_p99 | res%   | thp%   |
+|--------|------------------------------------|----------|----------|--------|--------|
+|  2 MiB | touch only (bug baseline)          |  15.4 µs |  15.8 µs | 100%   |    0%  |
+|  2 MiB | touch + `COLLAPSE`                 | 423.4 µs | 719.3 µs | 100%   |  100%  |
+|  2 MiB | `WILLNEED` + touch                 |  61.5 µs |  62.7 µs | 100%   |    0%  |
+|  2 MiB | `WILLNEED` + touch + `COLLAPSE`    | 494.3 µs |  1.62 ms | 100%   |  100%  |
+|  2 MiB | **`MAP_FIXED` remap + touch**      |  62.0 µs |  62.5 µs | 100%   |  100%  |
+|128 MiB | touch only (bug baseline)          |  3.06 ms |  3.17 ms | 100%   |    0%  |
+|128 MiB | touch + `COLLAPSE`                 | 25.35 ms | 27.24 ms | 100%   |  100%  |
+|128 MiB | `WILLNEED` + touch                 |  6.04 ms |  6.08 ms | 100%   |    0%  |
+|128 MiB | `WILLNEED` + touch + `COLLAPSE`    | 29.06 ms | 29.49 ms | 100%   |  100%  |
+|128 MiB | **`MAP_FIXED` remap + touch**      |  5.78 ms |  5.89 ms | 100%   |  100%  |
+
+**Takeaways**
+
+* **`MAP_FIXED` remap is by far the cheapest path in the pressure regime.** For 128 MiB: 5.6 ms vs 121 ms for WILLNEED+touch+COLLAPSE (~21×) and vs 421 ms for touch-only (~75×). Works because the kernel discards the swap entries associated with the old mapping and the new mapping faults in clean zero pages — no swap read-in, no PMD coalescence step. Matches the baseline fresh-fault cost of ~47 µs per PMD.
+* **`MADV_WILLNEED` does accelerate swap-in.** In the pressure regime it cuts touch-only cost by ~3–5× across sizes. The kernel's async swap readahead overlaps I/O effectively. No benefit in the idle regime (pages never left memory), and never restores THP on its own.
+* **`MADV_COLLAPSE` overhead is small and predictable.** The collapse work itself takes ~800 µs for 2 MiB to ~40 ms for 128 MiB (add-on on top of the touch). The expensive part of any touch+collapse path is the preceding touch/swap-in, not COLLAPSE itself.
+* **In the idle regime, all paths except "touch only" restore 100% THP.** Touch-only is the bug — it just dirties the 4 KiB pages the kernel staged.
+* **The difference between idle and pressure regimes is the cost of swap-in.** The bug's cost to callers is therefore load-dependent: on an idle system the only observable damage is 4 KiB TLB pressure in subsequent workloads; under memory pressure the damage compounds because every recycled region has to pay swap-in latency that a fresh mapping wouldn't.
+
 ### Implications for hugalloc
 
 The headline finding that changes the calculus: **`MADV_PAGEOUT` permanently splits the PMD, and `MADV_DONTNEED` does not un-split it.** None of the three DONTNEED-based mitigations from the issue restore THP backing after a caller has pageout'd a region. The current `eager_return=true` config is not a fix — experiment 5 shows it still yields `thp%=0` through the pool.
@@ -503,23 +563,28 @@ The headline finding that changes the calculus: **`MADV_PAGEOUT` permanently spl
   * #2 (`DONTNEED` only on promotion to global injector, currently behind `eager_return=true`) — same: **does not fix THP loss**. Experiment 5 confirms.
   * #3 (mincore-gated `DONTNEED`) — residency stays 100% on an idle host after user's PAGEOUT, so the gate would never fire; the advisory that does fire (DONTNEED) wouldn't fix it anyway.
   * #4 (doc-only) — remains a valid choice if the policy is to push the burden to callers. See "Guidance for callers" below.
-* **Primitives that do restore THP backing:**
-  1. **`MADV_COLLAPSE` (kernel ≥ 6.1)** — works reliably after the region has been re-populated. Cost is dominated by the re-population itself (the COLLAPSE call itself runs at memory-bandwidth speeds once pages are present). Doesn't help with the retouch fault cost, which has already been paid at 4 KiB granularity.
-  2. **`munmap` + fresh `mmap` with `MADV_HUGEPAGE`** — throws away the split PMD and starts over. Loses VA re-use for the recycled chunk but guarantees a clean state. Per-region cost is dominated by the fresh fault on next use (same ~47 µs per PMD as baseline first-touch).
-* **Handle-level tracking looks like the cleanest fix.** `Handle::pageout` could set a "tainted" bit; `Handle::drop` (or the allocator's deallocate path) reads that bit and routes tainted regions to a munmap-and-replace path rather than the normal recycle. Untainted regions stay on the fast pool-recycle path. This keeps the zero-overhead performance contract for the hot case and pays real cost only on dealloc-after-pageout. Not implemented — this experiment set is scoped to measurement.
+* **Primitives that do restore THP backing** (end-to-end costs measured in experiment 9 under a 512 MiB cgroup with pages truly in swap):
+  1. **`MAP_FIXED` remap + re-apply `MADV_HUGEPAGE`** — by far the cheapest. 2 MiB: ~107 µs; 128 MiB: ~5.6 ms. Works because the mmap call discards the old mapping's swap entries, so the next fault gets fresh zero-page THPs instead of having to read back from swap at 4 KiB. Preserves the region's virtual address (no change visible to the allocator's slicing).
+  2. **`MADV_WILLNEED` + touch + `MADV_COLLAPSE`** — middle ground. 2 MiB: ~2 ms; 128 MiB: ~122 ms. Preserves the user's data (swap-ins the original bytes), then coalesces. Use if dropping data is unacceptable.
+  3. **touch + `MADV_COLLAPSE`** without `WILLNEED` — same correctness but ~3–5× slower than WILLNEED variant because swap-in is unoptimized.
+* **Handle-level tracking is the cleanest fix.** `Handle::pageout` sets a "tainted" bit; `Handle::drop` reads that bit and, for tainted regions, does `mmap(addr, len, ..., MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)` + `madvise(MADV_HUGEPAGE)` before pushing the region to the pool. Untainted drops stay on the zero-overhead recycle path. Cost for tainted drops (measured in experiment 9): one mmap + one madvise syscall ≈ a few µs for the syscalls, plus the next caller pays a normal fresh THP fault (~47 µs per PMD). Amortized, the tainted path matches the performance of a never-pageout'd region — the user just pays for exactly what they asked the kernel to do.
 * **Swap round-trip is a separate axis.** Experiment 6 confirms `CONFIG_THP_SWAP` preserves THP on the swap-out write (`thp_swpout` increments by PMD count, `thp_swpout_fallback = 0`) but the swap-in path returns 4 KiB pages regardless. Experiment 4 confirms real cgroup-forced reclaim of COLD/PAGEOUT pages also ends at 4 KiB after refault. In other words: any path that takes a THP through swap (either direction) ends with a split.
 
 ### Guidance for callers (until a mitigation lands)
 
-Until hugalloc ships a handle-level mitigation, callers who use `Handle::pageout` should be aware that:
+Until hugalloc ships the handle-level mitigation, callers who use `Handle::pageout` should be aware that:
 
 * The region's PMDs are split by the advisory, permanently for that region.
 * If the handle is dropped, the pool recycles a 4 KiB-backed region to the next caller.
-* If the caller needs THP backing to persist, the cleanest recovery path is to **not** drop the handle — re-populate it and call `Handle`'s (hypothetical) `collapse` shim, or `madvise(MADV_COLLAPSE)` on the raw pointer after re-populating.
-* Alternatively, the caller can treat pageout'd regions as "tainted" and discard them, accepting that the pool's recycle benefit doesn't apply to this region.
+* `eager_return=true` does not repair this (confirmed in experiment 5).
 
-Experiments that would inform a decision on which mitigation strategy to ship:
+If the caller needs THP backing to persist across the pageout, the options in decreasing order of cost are:
 
-1. Hit rate of the "tainted handle" state in realistic workloads (is PAGEOUT common enough to justify the tracking overhead?).
-2. End-to-end cost of the munmap + remmap path through the pool, with bench numbers showing it does not materially hurt the hot path.
-3. Whether `MADV_COLLAPSE` can be called from the allocator itself on a fresh handed-out region (requires the region to be populated — only possible if the allocator populates on handout, which it does not currently).
+* **Don't drop — recover in place.** After re-using the region, call `madvise(MADV_WILLNEED)` + touch + `madvise(MADV_COLLAPSE)` on the raw pointer to re-coalesce. Cost ~2 ms for a 2 MiB region evicted to swap.
+* **Discard + fresh allocation.** `drop(handle); hugalloc::allocate(...)` — still hands back a tainted region from the pool. To truly discard, the user has to allocate *more* than the pool holds, which defeats the point.
+
+Experiments to inform the mitigation design (not in this set):
+
+1. Hit rate of the "tainted handle" state in realistic Materialize workloads — is PAGEOUT common enough to justify the bit and the branch in drop?
+2. End-to-end effect of adding `MAP_FIXED` remap on tainted drops through the real pool, measured against experiment 5's baseline.
+3. Whether to surface a `Handle::reclaim_for_reuse()` shim that the caller can invoke after re-populating, exposing COLLAPSE without needing the allocator to know about pageout state.
