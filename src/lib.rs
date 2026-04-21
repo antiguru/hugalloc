@@ -337,6 +337,14 @@ pub enum AllocError {
 #[derive(Error, Debug)]
 pub enum AdviseError {
     /// The requested byte range exceeds the allocation.
+    ///
+    /// `allocation_len` is the byte length of the conceptual allocation the
+    /// advisory was called on:
+    /// - For [`Handle::prefetch`] / [`Handle::cold`] / [`Handle::pageout`]:
+    ///   the raw size-class allocation length (may exceed the user-requested
+    ///   capacity by up to a factor of 2).
+    /// - For `Buffer<T>`'s advisory methods: `self.len() * size_of::<T>()`.
+    /// - For `RawBuffer<T>`'s advisory methods: `self.capacity() * size_of::<T>()`.
     #[error("advise byte range [{byte_offset}..{end}) exceeds allocation length {allocation_len}", end = byte_offset + byte_len)]
     OutOfBounds {
         /// Byte offset of the requested range.
