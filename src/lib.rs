@@ -28,11 +28,14 @@
 //!
 //! Use [`builder`] to build a configuration and apply it:
 //!
-//! ```ignore
-//! hugalloc::builder()
-//!     .enable()
-//!     .eager_return(true)
-//!     .apply()?;
+//! ```no_run
+//! fn main() -> Result<(), hugalloc::ConfigError> {
+//!     hugalloc::builder()
+//!         .enable()
+//!         .eager_return(true)
+//!         .apply()?;
+//!     Ok(())
+//! }
 //! ```
 //!
 //! See [`Builder`] for the full list of knobs.
@@ -1302,7 +1305,10 @@ impl From<&SizeClassState> for SizeClassStats {
 /// (which on THP-backed memory is a major cost). To zero a buffer
 /// explicitly:
 ///
-/// ```ignore
+/// ```no_run
+/// use std::mem::MaybeUninit;
+/// use hugalloc::RawBuffer;
+/// let n = 10;
 /// let mut raw: RawBuffer<u64> = RawBuffer::with_capacity(n);
 /// raw.as_uninit_slice_mut().fill(MaybeUninit::zeroed());
 /// ```
