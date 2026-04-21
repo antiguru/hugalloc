@@ -339,9 +339,13 @@ pub enum AllocError {
     /// Out of memory, meaning that the pool is exhausted.
     #[error("Out of memory")]
     OutOfMemory,
-    /// Size class too large or small
-    #[error("Invalid size class")]
-    InvalidSizeClass(usize),
+    /// Requested allocation size is outside the supported range.
+    /// See [`MIN_ALLOCATION_BYTES`] and [`MAX_ALLOCATION_BYTES`].
+    #[error("unsupported allocation size: {bytes} bytes (valid range is {min}..={max})", min = MIN_ALLOCATION_BYTES, max = MAX_ALLOCATION_BYTES)]
+    UnsupportedSize {
+        /// The user-requested size in bytes that could not be serviced.
+        bytes: usize,
+    },
     /// Allocator disabled
     #[error("Disabled by configuration")]
     Disabled,
@@ -417,7 +421,7 @@ impl SizeClass {
         if VALID_SIZE_CLASS.contains(&class) {
             Ok(Self(class))
         } else {
-            Err(AllocError::InvalidSizeClass(class))
+            Err(AllocError::UnsupportedSize { bytes: byte_size })
         }
     }
 
