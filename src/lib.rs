@@ -414,7 +414,11 @@ impl SizeClass {
     /// Obtain a size class from a size in bytes.
     fn from_byte_size(byte_size: usize) -> Result<Self, AllocError> {
         let class = byte_size.next_power_of_two().trailing_zeros() as usize;
-        class.try_into()
+        if VALID_SIZE_CLASS.contains(&class) {
+            Ok(Self(class))
+        } else {
+            Err(AllocError::InvalidSizeClass(class))
+        }
     }
 
     const fn from_byte_size_unchecked(byte_size: usize) -> Self {
@@ -422,17 +426,6 @@ impl SizeClass {
     }
 }
 
-impl TryFrom<usize> for SizeClass {
-    type Error = AllocError;
-
-    fn try_from(value: usize) -> Result<Self, Self::Error> {
-        if VALID_SIZE_CLASS.contains(&value) {
-            Ok(SizeClass(value))
-        } else {
-            Err(AllocError::InvalidSizeClass(value))
-        }
-    }
-}
 
 #[derive(Default, Debug)]
 struct AllocStats {
