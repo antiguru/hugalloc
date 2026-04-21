@@ -8,7 +8,7 @@
 //!
 //! The two most useful entry points for users:
 //!
-//! - [`Buffer`] — a Vec-like, length-tracking buffer with lgalloc-or-heap backing.
+//! - [`Buffer`] — a Vec-like, length-tracking buffer with hugalloc-or-heap backing.
 //! - [`RawBuffer`] — the underlying fixed-capacity uninitialized primitive.
 //!
 //! Low-level users can reach for [`allocate`] directly, which returns a [`Handle`]
@@ -205,6 +205,14 @@ impl Handle {
     /// split transparent huge pages.
     ///
     /// This is a performance hint and never affects correctness.
+    ///
+    /// ## Interaction with the allocator pool
+    ///
+    /// Paging out a region does not remove it from the pool. If you deallocate
+    /// a pageout'd region, the pool hands its cold, non-resident backing to the
+    /// next caller — writes to that region will fault and pay kernel page-in
+    /// cost. The pool does not guarantee resident memory across hand-offs.
+    /// See <https://github.com/antiguru/hugalloc/issues/1>.
     ///
     /// # Errors
     ///
@@ -1417,21 +1425,33 @@ impl<T> RawBuffer<T> {
         Buffer { raw: self, len }
     }
 
-    /// Prefetch the byte range covered by the given element range.
+    /// Prefetch the element range covered by the given range.
     ///
-    /// Element offsets are converted to byte offsets via
-    /// `checked_mul(size_of::<T>())`. On overflow, returns
-    /// `AdviseError::OutOfBounds` with saturating byte values.
+    /// Range is in element offsets, not bytes. Element offsets are converted
+    /// to byte offsets via `checked_mul(size_of::<T>())`. On overflow,
+    /// returns `AdviseError::OutOfBounds` with saturating byte values.
     pub fn prefetch(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, libc::MADV_WILLNEED)
     }
 
-    /// Mark a byte range as cold. See [`Handle::cold`].
+    /// Mark an element range as cold. See [`Handle::cold`].
+    ///
+    /// Range is in element offsets, not bytes.
     pub fn cold(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, MADV_COLD_STRATEGY)
     }
 
-    /// Request eviction of a byte range. See [`Handle::pageout`].
+    /// Request eviction of an element range. See [`Handle::pageout`].
+    ///
+    /// Range is in element offsets, not bytes.
+    ///
+    /// ## Interaction with the allocator pool
+    ///
+    /// Paging out a region does not remove it from the pool. If you deallocate
+    /// a pageout'd region, the pool hands its cold, non-resident backing to the
+    /// next caller — writes to that region will fault and pay kernel page-in
+    /// cost. The pool does not guarantee resident memory across hand-offs.
+    /// See <https://github.com/antiguru/hugalloc/issues/1>.
     pub fn pageout(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
     }
@@ -1612,17 +1632,22 @@ impl<T> Buffer<T> {
         (raw, len)
     }
 
-    /// See [`RawBuffer::prefetch`]. Bounds are against `len`, not `capacity`.
+    /// See [`RawBuffer::prefetch`]. Range is in element offsets, not bytes.
+    /// Bounds are against `len`, not `capacity`.
     pub fn prefetch(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, libc::MADV_WILLNEED)
     }
 
-    /// See [`RawBuffer::cold`]. Bounds are against `len`, not `capacity`.
+    /// See [`RawBuffer::cold`]. Range is in element offsets, not bytes.
+    /// Bounds are against `len`, not `capacity`.
     pub fn cold(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, MADV_COLD_STRATEGY)
     }
 
-    /// See [`RawBuffer::pageout`]. Bounds are against `len`, not `capacity`.
+    /// See [`RawBuffer::pageout`] for semantics. Range is in element offsets,
+    /// not bytes. Bounds are against `len`, not `capacity`.
+    ///
+    /// See [`RawBuffer::pageout`] for interaction with the allocator pool.
     pub fn pageout(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
     }
