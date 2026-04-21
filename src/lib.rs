@@ -961,7 +961,7 @@ impl BackgroundWorker {
         worker: &Worker<Handle>,
     ) -> usize {
         let byte_size = size_class.byte_size();
-        let floor = (self.config.clear_bytes + byte_size - 1) / byte_size;
+        let floor = self.config.clear_bytes.div_ceil(byte_size);
         let ceiling = floor.saturating_mul(64).max(1);
         let backlog = state.injector.len();
         let want = (backlog as f32 * self.config.decay) as usize;
@@ -1575,7 +1575,7 @@ impl<T> Buffer<T> {
         T: Copy,
     {
         assert!(
-            self.len.checked_add(s.len()).map_or(false, |n| n <= self.raw.capacity()),
+            self.len.checked_add(s.len()).is_some_and(|n| n <= self.raw.capacity()),
             "buffer capacity exceeded"
         );
         let slot = &mut self.raw.as_uninit_slice_mut()[self.len..self.len + s.len()];
@@ -1594,7 +1594,7 @@ impl<T> Buffer<T> {
     pub fn clear(&mut self) {
         // SAFETY: we own the first `len` elements and are about to reset len to 0.
         unsafe {
-            let slice: *mut [T] = std::slice::from_raw_parts_mut(
+            let slice: *mut [T] = std::ptr::slice_from_raw_parts_mut(
                 self.raw.as_uninit_slice_mut().as_mut_ptr().cast::<T>(),
                 self.len,
             );

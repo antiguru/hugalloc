@@ -159,7 +159,7 @@ fn handle_drop_returns_to_pool() {
     // parallel, so the counter can jump by more than one. We only need to
     // confirm Drop actually fired at least once.
     assert!(
-        after >= before + 1,
+        after > before,
         "expected at least one deallocation after handle dropped (before={before}, after={after})"
     );
 }

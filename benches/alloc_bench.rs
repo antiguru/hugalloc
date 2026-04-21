@@ -736,7 +736,8 @@ fn bench_ratio_sweep(total_mib: Option<usize>) {
         Arc::new(addrs)
     };
 
-    // Helper: apply madvise to all regions.
+    // Helper: apply madvise to all regions (only called in Linux cfg blocks).
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
     let madvise_all = |advice: libc::c_int| {
         for (ptr, cap, _) in &regions {
             unsafe { libc::madvise(ptr.as_ptr().cast(), *cap, advice) };
