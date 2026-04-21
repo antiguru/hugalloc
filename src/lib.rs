@@ -452,13 +452,22 @@ static LGALLOC_GROWTH_DAMPENER: AtomicUsize = AtomicUsize::new(0);
 /// The size of allocations to retain locally, per thread and size class.
 static LOCAL_BUFFER_BYTES: AtomicUsize = AtomicUsize::new(32 << 20);
 
+/// Combined state for the background worker: live handle/sender plus last-applied config.
+///
+/// Keeping them in a single mutex means a re-spawn can atomically read the
+/// last-known config and replace the handle without a TOCTOU window.
+struct BackgroundState {
+    handle: Option<(JoinHandle<()>, Sender<BackgroundConfigUpdate>)>,
+    last_config: BackgroundWorkerConfig,
+}
+
 /// Type maintaining the global state for each size class.
 struct GlobalStealer {
     /// State for each size class. An entry at position `x` handles size class `x`, which is areas
     /// of size `1<<x`.
     size_classes: Vec<SizeClassState>,
-    /// Shared token to access background thread.
-    background_sender: Mutex<Option<(JoinHandle<()>, Sender<BackgroundConfigUpdate>)>>,
+    /// Shared token to access background thread and its last-applied config.
+    background: Mutex<BackgroundState>,
 }
 
 /// Per-size-class state
@@ -504,7 +513,10 @@ impl GlobalStealer {
 
         Self {
             size_classes,
-            background_sender: Mutex::default(),
+            background: Mutex::new(BackgroundState {
+                handle: None,
+                last_config: BackgroundWorkerConfig::default(),
+            }),
         }
     }
 }
@@ -928,11 +940,19 @@ struct BackgroundWorker {
 }
 
 impl BackgroundWorker {
-    fn new(receiver: Receiver<BackgroundConfigUpdate>) -> Self {
+    /// Construct a worker pre-seeded with `config` rather than the default sentinel values.
+    ///
+    /// Used when re-spawning after a worker panic so that the new thread inherits the
+    /// last-applied interval, clear_bytes, and decay instead of reverting to
+    /// `Duration::MAX` / zero / 0.5.
+    fn new_with_config(
+        receiver: Receiver<BackgroundConfigUpdate>,
+        config: BackgroundWorkerConfig,
+    ) -> Self {
         let global_stealer = GlobalStealer::get_static();
         let worker = Worker::new_fifo();
         Self {
-            config: BackgroundWorkerConfig::default(),
+            config,
             receiver,
             global_stealer,
             worker,
@@ -1171,24 +1191,43 @@ fn send_background_update(
     stealer: &'static GlobalStealer,
     update: BackgroundConfigUpdate,
 ) -> Result<(), ConfigError> {
-    let mut lock = stealer.background_sender.lock().expect("lock poisoned");
-    let leftover = if let Some((_, sender)) = &*lock {
-        match sender.send(update.clone()) {
-            Ok(()) => None,
-            Err(err) => Some(err.0),
-        }
-    } else {
-        Some(update)
+    let mut state = stealer.background.lock().expect("lock poisoned");
+
+    // Overlay the update onto the last-known config FIRST, so we have a
+    // canonical "what the worker should be running" snapshot.
+    if let Some(i) = update.interval {
+        state.last_config.interval = i;
+    }
+    if let Some(c) = update.clear_bytes {
+        state.last_config.clear_bytes = c;
+    }
+    if let Some(d) = update.decay {
+        state.last_config.decay = d;
+    }
+
+    let config_for_respawn = state.last_config.clone();
+
+    // Try to send the partial update to the live worker first; fall through
+    // to re-spawn only if the send fails or no worker has ever been spawned.
+    let needs_spawn = match state.handle.as_ref() {
+        Some((_, sender)) => sender.send(update).is_err(),
+        None => true,
     };
-    if let Some(update) = leftover {
+
+    if needs_spawn {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let mut worker = BackgroundWorker::new(receiver);
+        // Seed the new worker with the full last-applied config (not
+        // `Default::default()`). This matters when re-spawning after a
+        // panic: without the seed, interval/clear_bytes/decay revert to
+        // sentinel defaults and the worker effectively stops ticking.
+        let mut worker = BackgroundWorker::new_with_config(receiver, config_for_respawn);
         let join_handle = std::thread::Builder::new()
             .name("hugalloc-0".to_string())
             .spawn(move || worker.run())
             .map_err(ConfigError::BackgroundWorkerFailed)?;
-        sender.send(update).expect("Receiver exists");
-        *lock = Some((join_handle, sender));
+        // Don't send the partial update separately — the fresh worker
+        // already has the full config baked in.
+        state.handle = Some((join_handle, sender));
     }
     Ok(())
 }

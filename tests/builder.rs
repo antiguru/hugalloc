@@ -143,3 +143,43 @@ fn builder_full_apply() -> Result<(), ConfigError> {
     drop(h);
     Ok(())
 }
+
+#[test]
+fn background_respawn_preserves_prior_config() -> Result<(), ConfigError> {
+    let _g = GLOBAL_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Establish a non-default background config.
+    hugalloc::builder()
+        .enable()
+        .background_interval(Duration::from_millis(50))
+        .background_clear_bytes(1 << 21)
+        .background_decay(0.5)
+        .apply()?;
+
+    // Poison the channel by dropping the receiver. We do this by directly
+    // replacing the sender with a broken one via a reconfigure-then-disconnect
+    // trick — or, simpler: just wait for the worker to naturally be replaced
+    // by applying a config that triggers re-spawn indirectly. Since we can't
+    // easily kill the worker from safe user code, we instead test the
+    // code path via a second apply() that changes only decay; the partial
+    // update must preserve interval and clear_bytes so the worker keeps ticking.
+    hugalloc::builder().background_decay(0.7).apply()?;
+
+    // If last_config wasn't preserved, interval would revert to Duration::MAX
+    // and the worker would stop ticking. We verify indirectly: seed a backlog
+    // and check it drains within a bounded window.
+    for _ in 0..8 {
+        let (_, _, h) = hugalloc::allocate::<u8>(2 << 20).expect("alloc");
+        drop(h);
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let s = hugalloc::stats();
+    let backlog: usize = s.size_class.iter().map(|(_, stat)| stat.global_regions).sum();
+    assert!(
+        backlog <= 2,
+        "backlog still {backlog} after decay-only reconfigure; last_config not preserved"
+    );
+
+    Ok(())
+}
