@@ -47,7 +47,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::mem::{take, ManuallyDrop, MaybeUninit};
+use std::mem::{ManuallyDrop, MaybeUninit, take};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -288,7 +288,7 @@ const INITIAL_SIZE: usize = 32 << 20;
 /// Inclusive-exclusive range of valid size-class shifts. Internal scaffolding —
 /// clients should look at [`MIN_ALLOCATION_BYTES`] and [`MAX_ALLOCATION_BYTES`]
 /// instead.
-const VALID_SIZE_CLASS: Range<usize> = 21..37;
+const VALID_SIZE_CLASS: Range<usize> = 21..38;
 
 /// Smallest allocation hugalloc will service, in bytes (= 2^21 = 2 MiB).
 /// Allocations smaller than this are rounded up to this size.
@@ -429,7 +429,6 @@ impl SizeClass {
         Self::new_unchecked(byte_size.next_power_of_two().trailing_zeros() as usize)
     }
 }
-
 
 #[derive(Default, Debug)]
 struct AllocStats {
@@ -1030,7 +1029,9 @@ impl BackgroundWorker {
                     Ok(()) => count += 1,
                     Err(e) => {
                         if !CLEAR_FAILED_WARNED.swap(true, Ordering::Relaxed) {
-                            eprintln!("hugalloc: background clear failed: {e}. Continuing; the region still returns to the clean injector with its prior content.");
+                            eprintln!(
+                                "hugalloc: background clear failed: {e}. Continuing; the region still returns to the clean injector with its prior content."
+                            );
                         }
                     }
                 }
@@ -1177,17 +1178,16 @@ fn apply_config(b: Builder) -> Result<(), ConfigError> {
         LOCAL_BUFFER_BYTES.store(local_buffer_bytes, Ordering::Relaxed);
     }
 
-    let decay = b.background_decay.map(|d| {
-        if d.is_nan() { 0.5 } else { d.clamp(0.0, 1.0) }
-    });
+    let decay = b
+        .background_decay
+        .map(|d| if d.is_nan() { 0.5 } else { d.clamp(0.0, 1.0) });
     let update = BackgroundConfigUpdate {
         interval: b.background_interval,
         clear_bytes: b.background_clear_bytes,
         decay,
     };
-    let any_background = update.interval.is_some()
-        || update.clear_bytes.is_some()
-        || update.decay.is_some();
+    let any_background =
+        update.interval.is_some() || update.clear_bytes.is_some() || update.decay.is_some();
     if any_background {
         send_background_update(stealer, update)?;
     }
@@ -1473,12 +1473,12 @@ impl<T> RawBuffer<T> {
     /// The pointer, capacity, and handle must have come from a prior call to
     /// [`RawBuffer::into_raw_parts`] on the same process, and none of them
     /// must have been freed or reconstructed since.
-    pub unsafe fn from_raw_parts(
-        ptr: NonNull<T>,
-        capacity: usize,
-        handle: Option<Handle>,
-    ) -> Self {
-        Self { handle, ptr, capacity }
+    pub unsafe fn from_raw_parts(ptr: NonNull<T>, capacity: usize, handle: Option<Handle>) -> Self {
+        Self {
+            handle,
+            ptr,
+            capacity,
+        }
     }
 
     /// Convert into a [`Buffer`] with the first `len` elements assumed initialized.
@@ -1547,9 +1547,10 @@ impl<T> RawBuffer<T> {
                 let allocation_len = self.capacity.saturating_mul(elem_size);
                 return Err(AdviseError::OutOfBounds {
                     byte_offset: range.start.saturating_mul(elem_size),
-                    byte_len: range.end.saturating_mul(elem_size).saturating_sub(
-                        range.start.saturating_mul(elem_size),
-                    ),
+                    byte_len: range
+                        .end
+                        .saturating_mul(elem_size)
+                        .saturating_sub(range.start.saturating_mul(elem_size)),
                     allocation_len,
                 });
             }
@@ -1669,17 +1670,15 @@ impl<T> Buffer<T> {
         T: Copy,
     {
         assert!(
-            self.len.checked_add(s.len()).is_some_and(|n| n <= self.raw.capacity()),
+            self.len
+                .checked_add(s.len())
+                .is_some_and(|n| n <= self.raw.capacity()),
             "buffer capacity exceeded"
         );
         let slot = &mut self.raw.as_uninit_slice_mut()[self.len..self.len + s.len()];
         // SAFETY: T: Copy means the source bytes are safe to copy; slot is distinct memory.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                s.as_ptr(),
-                slot.as_mut_ptr().cast::<T>(),
-                s.len(),
-            );
+            std::ptr::copy_nonoverlapping(s.as_ptr(), slot.as_mut_ptr().cast::<T>(), s.len());
         }
         self.len += s.len();
     }
@@ -1750,10 +1749,7 @@ impl<T> std::ops::Deref for Buffer<T> {
     fn deref(&self) -> &[T] {
         // SAFETY: elements 0..len are initialized.
         unsafe {
-            std::slice::from_raw_parts(
-                self.raw.as_uninit_slice().as_ptr().cast::<T>(),
-                self.len,
-            )
+            std::slice::from_raw_parts(self.raw.as_uninit_slice().as_ptr().cast::<T>(), self.len)
         }
     }
 }

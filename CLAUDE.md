@@ -14,7 +14,7 @@ Cargo runs tests-within-a-binary in parallel; tests that race on the globals wit
 
 ## Size-class floor is 2 MiB
 
-`MIN_ALLOCATION_BYTES = 1 << 21 = 2 MiB`; `MAX_ALLOCATION_BYTES = 1 << 36 = 64 GiB` (see the public constants in `src/lib.rs`). The smallest region the allocator hands out is `MIN_ALLOCATION_BYTES` bytes. Consequences:
+`MIN_ALLOCATION_BYTES = 1 << 21 = 2 MiB`; `MAX_ALLOCATION_BYTES = 1 << 37 = 128 GiB` (see the public constants in `src/lib.rs`). The smallest region the allocator hands out is `MIN_ALLOCATION_BYTES` bytes. Consequences:
 
 - `hugalloc::allocate::<u8>(small_n)` rounds up to 2 MiB.
 - Tests that assert on `global_regions` counts need `local_buffer_bytes` set small enough that dropped handles overflow the thread-local cache into the global injector. `local_buffer_bytes(1 << 21)` keeps one region per thread; further drops go global.
