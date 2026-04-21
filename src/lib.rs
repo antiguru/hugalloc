@@ -1367,6 +1367,24 @@ impl<T> RawBuffer<T> {
     ) -> Self {
         Self { handle, ptr, capacity }
     }
+
+    /// Convert into a [`Buffer`] with the first `len` elements assumed initialized.
+    ///
+    /// # Safety
+    ///
+    /// Elements `0..len` of the buffer must be initialized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len > self.capacity`.
+    pub unsafe fn assume_init_buffer(self, len: usize) -> Buffer<T> {
+        assert!(
+            len <= self.capacity,
+            "assume_init_buffer len ({len}) exceeds capacity ({})",
+            self.capacity
+        );
+        Buffer { raw: self, len }
+    }
 }
 
 impl<T> Drop for RawBuffer<T> {
@@ -1386,5 +1404,153 @@ impl<T> Drop for RawBuffer<T> {
                 );
             }
         }
+    }
+}
+
+/// Fixed-capacity length-tracking buffer. Like `Vec<T>` but cannot grow
+/// past its initial capacity.
+///
+/// Backed by a [`RawBuffer<T>`]. Its `Drop` drops the first `len` elements
+/// in order, then releases the backing.
+pub struct Buffer<T> {
+    raw: RawBuffer<T>,
+    len: usize,
+}
+
+impl<T> Buffer<T> {
+    /// Allocate a buffer with capacity for `n` elements of `T`.
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            raw: RawBuffer::with_capacity(n),
+            len: 0,
+        }
+    }
+
+    /// Allocate a buffer from lgalloc. See [`RawBuffer::try_lgalloc`].
+    pub fn try_lgalloc(n: usize) -> Result<Self, AllocError> {
+        Ok(Self {
+            raw: RawBuffer::try_lgalloc(n)?,
+            len: 0,
+        })
+    }
+
+    /// Allocate a buffer from the system heap. See [`RawBuffer::heap`].
+    pub fn heap(n: usize) -> Self {
+        Self {
+            raw: RawBuffer::heap(n),
+            len: 0,
+        }
+    }
+
+    /// Length of the buffer (number of initialized elements).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns `true` if the buffer contains no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Capacity, in elements.
+    pub fn capacity(&self) -> usize {
+        self.raw.capacity()
+    }
+
+    /// Whether the backing is an lgalloc handle (true) or a heap fallback (false).
+    pub fn is_lgalloc(&self) -> bool {
+        self.raw.is_lgalloc()
+    }
+
+    /// Append a value to the end of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer is at capacity.
+    pub fn push(&mut self, value: T) {
+        assert!(self.len < self.raw.capacity(), "buffer at capacity");
+        self.raw.as_uninit_slice_mut()[self.len].write(value);
+        self.len += 1;
+    }
+
+    /// Append the entire slice to the end of the buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the buffer has insufficient remaining capacity.
+    pub fn extend_from_slice(&mut self, s: &[T])
+    where
+        T: Copy,
+    {
+        assert!(
+            self.len.checked_add(s.len()).map_or(false, |n| n <= self.raw.capacity()),
+            "buffer capacity exceeded"
+        );
+        let slot = &mut self.raw.as_uninit_slice_mut()[self.len..self.len + s.len()];
+        // SAFETY: T: Copy means the source bytes are safe to copy; slot is distinct memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                s.as_ptr(),
+                slot.as_mut_ptr().cast::<T>(),
+                s.len(),
+            );
+        }
+        self.len += s.len();
+    }
+
+    /// Drop all elements, setting `len` to 0 but preserving capacity.
+    pub fn clear(&mut self) {
+        // SAFETY: we own the first `len` elements and are about to reset len to 0.
+        unsafe {
+            let slice: *mut [T] = std::slice::from_raw_parts_mut(
+                self.raw.as_uninit_slice_mut().as_mut_ptr().cast::<T>(),
+                self.len,
+            );
+            std::ptr::drop_in_place(slice);
+        }
+        self.len = 0;
+    }
+
+    /// Consume the buffer into its underlying [`RawBuffer`] and length.
+    pub fn into_raw_parts(self) -> (RawBuffer<T>, usize) {
+        let len = self.len;
+        // SAFETY: move raw out without running the Buffer's Drop (which would re-drop elements).
+        let raw = unsafe { std::ptr::read(&self.raw) };
+        std::mem::forget(self);
+        (raw, len)
+    }
+}
+
+impl<T> std::ops::Deref for Buffer<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        // SAFETY: elements 0..len are initialized.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.raw.as_uninit_slice().as_ptr().cast::<T>(),
+                self.len,
+            )
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for Buffer<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: elements 0..len are initialized.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.raw.as_uninit_slice_mut().as_mut_ptr().cast::<T>(),
+                self.len,
+            )
+        }
+    }
+}
+
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        // Drop the first `len` initialized elements. The RawBuffer's Drop
+        // then releases the backing.
+        self.clear();
     }
 }

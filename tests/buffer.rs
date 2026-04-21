@@ -1,6 +1,6 @@
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
-use hugalloc::{RawBuffer, AllocError};
+use hugalloc::{RawBuffer, AllocError, Buffer};
 
 /// Serializes tests that toggle global lgalloc state (enable/disable).
 static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
@@ -68,4 +68,74 @@ fn rawbuffer_uninit_slice_roundtrip() {
         assert_eq!(slice[0].assume_init_read(), 42);
         assert_eq!(slice[1].assume_init_read(), 99);
     }
+}
+
+#[test]
+fn buffer_push_extend_clear() {
+    initialize();
+    let mut buf: Buffer<u32> = Buffer::with_capacity(16);
+    assert_eq!(buf.len(), 0);
+    assert!(buf.capacity() >= 16);
+    buf.push(1);
+    buf.push(2);
+    buf.extend_from_slice(&[3, 4, 5]);
+    assert_eq!(&*buf, &[1, 2, 3, 4, 5]);
+    buf.clear();
+    assert_eq!(buf.len(), 0);
+    assert!(buf.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "capacity")]
+fn buffer_push_over_capacity_panics() {
+    initialize();
+    let mut buf: Buffer<u32> = Buffer::heap(2);
+    buf.push(1);
+    buf.push(2);
+    buf.push(3); // Should panic.
+}
+
+#[test]
+#[should_panic(expected = "capacity")]
+fn buffer_extend_over_capacity_panics() {
+    initialize();
+    let mut buf: Buffer<u32> = Buffer::heap(4);
+    buf.extend_from_slice(&[1, 2, 3, 4, 5]); // Should panic.
+}
+
+#[test]
+fn buffer_drop_runs_element_destructors() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Counter;
+    impl Drop for Counter {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    initialize();
+    DROPS.store(0, Ordering::Relaxed);
+    {
+        let mut buf: Buffer<Counter> = Buffer::heap(8);
+        buf.push(Counter);
+        buf.push(Counter);
+        buf.push(Counter);
+    }
+    assert_eq!(DROPS.load(Ordering::Relaxed), 3);
+}
+
+#[test]
+fn buffer_assume_init_roundtrip() {
+    initialize();
+    let mut raw: RawBuffer<u64> = RawBuffer::with_capacity(64);
+    for i in 0..64 {
+        raw.as_uninit_slice_mut()[i].write(i as u64);
+    }
+    // SAFETY: we initialized elements 0..64.
+    let buf: Buffer<u64> = unsafe { raw.assume_init_buffer(64) };
+    assert_eq!(buf.len(), 64);
+    assert_eq!(buf[0], 0);
+    assert_eq!(buf[63], 63);
 }
