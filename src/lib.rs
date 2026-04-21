@@ -214,8 +214,18 @@ impl Handle {
     /// Paging out a region does not remove it from the pool. If you deallocate
     /// a pageout'd region, the pool hands its cold, non-resident backing to the
     /// next caller — writes to that region will fault and pay kernel page-in
-    /// cost. The pool does not guarantee resident memory across hand-offs.
+    /// cost, and the region's PMDs stay split at 4 KiB regardless of the
+    /// `MADV_HUGEPAGE` hint. The pool does not guarantee resident memory or
+    /// THP backing across hand-offs.
     /// See <https://github.com/antiguru/hugalloc/issues/1>.
+    ///
+    /// ## Recovering THP after `pageout`
+    ///
+    /// If the same handle is re-used after `pageout`, call
+    /// [`Handle::restore_thp`] to fault the pages back in and re-coalesce
+    /// the PMDs. A plain re-touch will find the pages (fast, if they never
+    /// actually evicted; slow, if they did), but `restore_thp` also issues
+    /// `MADV_COLLAPSE` so the range ends up THP-backed.
     ///
     /// # Errors
     ///
@@ -223,6 +233,42 @@ impl Handle {
     /// allocation length.
     pub fn pageout(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_range(byte_range, MADV_PAGEOUT_STRATEGY)
+    }
+
+    /// Restore transparent huge page backing over a byte range after a prior
+    /// [`Handle::pageout`].
+    ///
+    /// A call to `pageout` splits the range's PMDs into 4 KiB PTE subtables
+    /// and stages the pages for eviction. After the region is accessed again
+    /// — either on an idle host (where pages stayed mapped) or after actual
+    /// reclaim has pushed them to swap — the VMA is 4 KiB-backed. Linux does
+    /// not rebuild THP on swap-in, and `MADV_DONTNEED` cannot un-split a
+    /// PMD, so there is no single-step way to get THP back. `restore_thp`
+    /// issues the three-step sequence that does work:
+    ///
+    /// 1. `MADV_WILLNEED` — async swap readahead (accelerates swap-in when
+    ///    pages are actually in swap).
+    /// 2. `MADV_POPULATE_READ` — synchronously fault in every page
+    ///    (Linux 5.14+). Brings pages resident without overwriting them.
+    /// 3. `MADV_COLLAPSE` — coalesce resident 4 KiB PTEs back into a PMD
+    ///    (Linux 6.1+).
+    ///
+    /// On kernels that don't support `MADV_POPULATE_READ` or `MADV_COLLAPSE`,
+    /// the corresponding step is skipped via the same `-1` sentinel pattern
+    /// used by [`Handle::cold`] / [`Handle::pageout`] — the call still
+    /// succeeds but the range may end up resident at 4 KiB only.
+    ///
+    /// This is a performance hint and never affects correctness. Data in the
+    /// range is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdviseError::OutOfBounds`] if `byte_range.end` exceeds the
+    /// allocation length. Per-step kernel failures are silently ignored.
+    pub fn restore_thp(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_range(byte_range.clone(), libc::MADV_WILLNEED)?;
+        self.advise_range(byte_range.clone(), MADV_POPULATE_READ_STRATEGY)?;
+        self.advise_range(byte_range, MADV_COLLAPSE_STRATEGY)
     }
 
     /// Consume the handle and return its raw components. The caller becomes
@@ -316,6 +362,18 @@ const MADV_COLD_STRATEGY: libc::c_int = -1;
 const MADV_PAGEOUT_STRATEGY: libc::c_int = libc::MADV_PAGEOUT;
 #[cfg(not(target_os = "linux"))]
 const MADV_PAGEOUT_STRATEGY: libc::c_int = -1;
+
+/// Linux-only (5.14+) "synchronously populate for read" advice; `-1` sentinel elsewhere.
+#[cfg(target_os = "linux")]
+const MADV_POPULATE_READ_STRATEGY: libc::c_int = libc::MADV_POPULATE_READ;
+#[cfg(not(target_os = "linux"))]
+const MADV_POPULATE_READ_STRATEGY: libc::c_int = -1;
+
+/// Linux-only (6.1+) "coalesce 4 KiB PTEs into a PMD THP" advice; `-1` sentinel elsewhere.
+#[cfg(target_os = "linux")]
+const MADV_COLLAPSE_STRATEGY: libc::c_int = libc::MADV_COLLAPSE;
+#[cfg(not(target_os = "linux"))]
+const MADV_COLLAPSE_STRATEGY: libc::c_int = -1;
 
 /// Whether we have already warned about `MADV_HUGEPAGE` failure.
 #[cfg(target_os = "linux")]
@@ -1530,6 +1588,15 @@ impl<T> RawBuffer<T> {
         self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
     }
 
+    /// Restore THP backing over an element range. See [`Handle::restore_thp`].
+    ///
+    /// Range is in element offsets, not bytes.
+    pub fn restore_thp(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range.clone(), libc::MADV_WILLNEED)?;
+        self.advise_element_range(range.clone(), MADV_POPULATE_READ_STRATEGY)?;
+        self.advise_element_range(range, MADV_COLLAPSE_STRATEGY)
+    }
+
     fn advise_element_range(
         &self,
         range: Range<usize>,
@@ -1723,6 +1790,14 @@ impl<T> Buffer<T> {
     /// See [`RawBuffer::pageout`] for interaction with the allocator pool.
     pub fn pageout(&self, range: Range<usize>) -> Result<(), AdviseError> {
         self.advise_element_range(range, MADV_PAGEOUT_STRATEGY)
+    }
+
+    /// See [`RawBuffer::restore_thp`]. Range is in element offsets, not bytes.
+    /// Bounds are against `len`, not `capacity`.
+    pub fn restore_thp(&self, range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_element_range(range.clone(), libc::MADV_WILLNEED)?;
+        self.advise_element_range(range.clone(), MADV_POPULATE_READ_STRATEGY)?;
+        self.advise_element_range(range, MADV_COLLAPSE_STRATEGY)
     }
 
     fn advise_element_range(

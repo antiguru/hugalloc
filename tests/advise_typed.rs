@@ -17,7 +17,9 @@ fn rawbuffer_prefetch_element_range() {
     raw.prefetch(100..200).unwrap();
     raw.cold(0..512).unwrap();
     raw.pageout(512..1024).unwrap();
+    raw.restore_thp(0..raw.capacity()).unwrap();
     assert!(raw.prefetch(0..raw.capacity() + 1).is_err());
+    assert!(raw.restore_thp(0..raw.capacity() + 1).is_err());
 }
 
 #[test]
@@ -28,7 +30,9 @@ fn buffer_prefetch_element_range() {
     buf.prefetch(0..buf.len()).unwrap();
     buf.cold(0..buf.len()).unwrap();
     buf.pageout(0..buf.len()).unwrap();
+    buf.restore_thp(0..buf.len()).unwrap();
     assert!(buf.prefetch(0..buf.len() + 1).is_err());
+    assert!(buf.restore_thp(0..buf.len() + 1).is_err());
 }
 
 #[test]
