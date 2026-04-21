@@ -941,9 +941,12 @@ impl BackgroundWorker {
         state: &SizeClassState,
         worker: &Worker<Handle>,
     ) -> usize {
-        // Clear batch size, and at least one element.
         let byte_size = size_class.byte_size();
-        let mut limit = (self.config.clear_bytes + byte_size - 1) / byte_size;
+        let floor = (self.config.clear_bytes + byte_size - 1) / byte_size;
+        let ceiling = floor.saturating_mul(64).max(1);
+        let backlog = state.injector.len();
+        let want = (backlog as f32 * self.config.decay) as usize;
+        let mut limit = want.max(floor).min(ceiling);
         let mut count = 0;
         let mut steal = Steal::Retry;
         while limit > 0 && !steal.is_empty() {
