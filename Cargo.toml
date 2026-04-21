@@ -21,6 +21,10 @@ hdrhistogram = "7"
 name = "alloc_bench"
 harness = false
 
+[[bench]]
+name = "pageout_bench"
+harness = false
+
 [profile.release]
 debug = 2
 codegen-units = 1
