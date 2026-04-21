@@ -285,8 +285,18 @@ impl Drop for Handle {
 /// Initial area size
 const INITIAL_SIZE: usize = 32 << 20;
 
-/// Range of valid size classes.
-pub const VALID_SIZE_CLASS: Range<usize> = 21..37;
+/// Inclusive-exclusive range of valid size-class shifts. Internal scaffolding —
+/// clients should look at [`MIN_ALLOCATION_BYTES`] and [`MAX_ALLOCATION_BYTES`]
+/// instead.
+const VALID_SIZE_CLASS: Range<usize> = 21..37;
+
+/// Smallest allocation hugalloc will service, in bytes (= 2^21 = 2 MiB).
+/// Allocations smaller than this are rounded up to this size.
+pub const MIN_ALLOCATION_BYTES: usize = 1 << VALID_SIZE_CLASS.start;
+
+/// Largest allocation hugalloc will service, in bytes (= 2^(end - 1)).
+/// Allocations larger than this return [`AllocError::UnsupportedSize`].
+pub const MAX_ALLOCATION_BYTES: usize = 1 << (VALID_SIZE_CLASS.end - 1);
 
 /// Strategy for background worker clear: `MADV_FREE` on Linux (lazy reclaim), `MADV_DONTNEED` elsewhere.
 #[cfg(target_os = "linux")]
