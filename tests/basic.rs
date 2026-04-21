@@ -187,3 +187,21 @@ fn handle_drop_returns_to_pool() {
         "expected at least one deallocation after handle dropped (before={before}, after={after})"
     );
 }
+
+#[test]
+fn handle_into_raw_parts_roundtrip() {
+    initialize();
+
+    let (_, cap, handle) = hugalloc::allocate::<u8>(2 << 20).expect("allocate");
+    let byte_len = cap;
+
+    let (ptr, len) = handle.into_raw_parts();
+    assert_eq!(len, byte_len);
+
+    // Reconstruct. Must not double-deallocate; the previous Handle's Drop was
+    // suppressed by into_raw_parts calling mem::forget internally.
+    // SAFETY: ptr and len just came from into_raw_parts above.
+    let rebuilt = unsafe { hugalloc::Handle::from_raw_parts(ptr, len) };
+    drop(rebuilt);
+    // If double-free happens, subsequent allocations or stats would misbehave.
+}

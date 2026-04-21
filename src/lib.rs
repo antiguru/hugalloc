@@ -154,6 +154,30 @@ impl Handle {
         Ok(())
     }
 
+    /// Consume the handle and return its raw components. The caller becomes
+    /// responsible for the allocation and must reconstruct via
+    /// [`Handle::from_raw_parts`] to release it, or leak the memory
+    /// permanently via [`std::mem::forget`].
+    pub fn into_raw_parts(self) -> (NonNull<u8>, usize) {
+        let parts = (self.ptr, self.len);
+        std::mem::forget(self);
+        parts
+    }
+
+    /// Reconstruct a `Handle` from a pointer and length previously returned
+    /// by [`Handle::into_raw_parts`].
+    ///
+    /// # Safety
+    ///
+    /// - `ptr` and `len` must have come from a prior call to
+    ///   `Handle::into_raw_parts` on the same process.
+    /// - The allocation must not have been freed or reconstructed since.
+    /// - Calling `from_raw_parts` twice on the same pair of values without
+    ///   an intervening deallocate produces aliasing and is undefined behavior.
+    pub unsafe fn from_raw_parts(ptr: NonNull<u8>, len: usize) -> Self {
+        Self { ptr, len }
+    }
+
     /// Call `madvise` on the memory region. Unsafe because `advice` is passed verbatim.
     unsafe fn madvise(&self, advice: libc::c_int) -> std::io::Result<()> {
         // SAFETY: Calling into `madvise`:
