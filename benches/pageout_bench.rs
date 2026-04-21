@@ -610,6 +610,9 @@ fn run_pressure() {
 /// `MADV_COLLAPSE` was added in 6.1; libc may not export it on older targets.
 const MADV_COLLAPSE_NUM: libc::c_int = 25;
 
+/// `MADV_POPULATE_READ` was added in 5.14; libc may not export it.
+const MADV_POPULATE_READ_NUM: libc::c_int = 22;
+
 /// Probe whether a PMD that was split by `MADV_PAGEOUT` can be re-coalesced
 /// into a THP through various recovery paths:
 ///   (a) `MADV_DONTNEED` + retouch — relies on re-fault picking the PMD path
@@ -811,6 +814,39 @@ fn run_recovery() {
                 for i in (0..slice.len()).step_by(p.page_size) {
                     unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
                 }
+                unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_COLLAPSE_NUM) };
+            },
+        );
+
+        run_recovery_path(
+            size,
+            reps,
+            pressure_size,
+            "POPULATE_READ + COLLAPSE",
+            |p| {
+                // MADV_POPULATE_READ (5.14+) synchronously populates the
+                // range with read-only faults. Brings pages back from swap
+                // without the caller needing to touch, and without
+                // overwriting data. COLLAPSE then coalesces back to PMDs.
+                let r = unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_POPULATE_READ_NUM) };
+                if r != 0 {
+                    eprintln!(
+                        "  (POPULATE_READ ret={r}: {})",
+                        std::io::Error::last_os_error()
+                    );
+                }
+                unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_COLLAPSE_NUM) };
+            },
+        );
+
+        run_recovery_path(
+            size,
+            reps,
+            pressure_size,
+            "WILLNEED + POPULATE_READ + COLLAPSE",
+            |p| {
+                unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_WILLNEED) };
+                unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_POPULATE_READ_NUM) };
                 unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_COLLAPSE_NUM) };
             },
         );
