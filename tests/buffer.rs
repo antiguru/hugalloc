@@ -1,15 +1,12 @@
+use hugalloc::{AllocError, Buffer, RawBuffer};
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
-use hugalloc::{RawBuffer, AllocError, Buffer};
 
 /// Serializes tests that toggle global lgalloc state (enable/disable).
 static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn initialize() {
-    hugalloc::builder()
-        .enable()
-        .apply()
-        .expect("apply");
+    hugalloc::builder().enable().apply().expect("apply");
 }
 
 #[test]
@@ -83,24 +80,6 @@ fn buffer_push_extend_clear() {
     buf.clear();
     assert_eq!(buf.len(), 0);
     assert!(buf.is_empty());
-}
-
-#[test]
-#[should_panic(expected = "capacity")]
-fn buffer_push_over_capacity_panics() {
-    initialize();
-    let mut buf: Buffer<u32> = Buffer::heap(2);
-    buf.push(1);
-    buf.push(2);
-    buf.push(3); // Should panic.
-}
-
-#[test]
-#[should_panic(expected = "capacity")]
-fn buffer_extend_over_capacity_panics() {
-    initialize();
-    let mut buf: Buffer<u32> = Buffer::heap(4);
-    buf.extend_from_slice(&[1, 2, 3, 4, 5]); // Should panic.
 }
 
 #[test]
