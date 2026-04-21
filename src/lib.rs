@@ -41,10 +41,12 @@ mod readme {
     #![doc = include_str!("../README.md")]
 }
 
-/// Handle to describe allocations.
+/// Handle to an allocation obtained from [`allocate`].
 ///
-/// Handles represent a leased allocation, which must be explicitly freed. Otherwise, the caller will permanently leak
-/// the associated memory.
+/// Dropping a `Handle` returns its memory to the pool. The pool is
+/// lock-free and the drop may occur on any thread. To release eagerly,
+/// call `drop(handle)`. To intentionally leak the allocation, use
+/// [`std::mem::forget`].
 pub struct Handle {
     /// The actual pointer.
     ptr: NonNull<u8>,

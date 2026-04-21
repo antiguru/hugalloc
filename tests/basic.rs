@@ -171,10 +171,7 @@ fn handle_drop_returns_to_pool() {
 
     {
         let (_, _, _handle) = hugalloc::allocate::<u8>(2 << 20).expect("allocate");
-        // Handle dropped at end of scope; should trigger pool return.
     }
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
 
     let after = hugalloc::stats()
         .size_class
@@ -182,5 +179,9 @@ fn handle_drop_returns_to_pool() {
         .map(|(_, s)| s.deallocations)
         .sum::<u64>();
 
-    assert!(after > before, "expected deallocate count to increase after drop (before={before}, after={after})");
+    assert_eq!(
+        after,
+        before + 1,
+        "expected exactly one deallocation after handle dropped (before={before}, after={after})"
+    );
 }
