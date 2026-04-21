@@ -25,7 +25,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::mem::{take, ManuallyDrop};
+use std::mem::{take, ManuallyDrop, MaybeUninit};
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1242,6 +1242,149 @@ impl From<&SizeClassState> for SizeClassStats {
             slow_path,
             clear_eager_total,
             clear_slow_total,
+        }
+    }
+}
+
+/// Fixed-capacity uninitialized allocation. lgalloc-backed when possible,
+/// heap fallback otherwise.
+///
+/// Analogous to `Box<[MaybeUninit<T>]>` but with a hugalloc backing and an
+/// explicit fallback mode.
+///
+/// `RawBuffer` does **not** drop its elements. Its `Drop` only releases the
+/// backing. Users who need element destructors should convert to
+/// [`Buffer`] via [`RawBuffer::assume_init_buffer`] after initialization.
+///
+/// # Zeroing
+///
+/// No `_zeroed` constructor exists. Fresh lgalloc regions may contain stale
+/// bytes from prior use, and memset-zero forces full residency up front
+/// (which on THP-backed memory is a major cost). To zero a buffer
+/// explicitly:
+///
+/// ```ignore
+/// let mut raw: RawBuffer<u64> = RawBuffer::with_capacity(n);
+/// raw.as_uninit_slice_mut().fill(MaybeUninit::zeroed());
+/// ```
+pub struct RawBuffer<T> {
+    handle: Option<Handle>,
+    ptr: NonNull<T>,
+    capacity: usize,
+}
+
+unsafe impl<T: Send> Send for RawBuffer<T> {}
+
+impl<T> RawBuffer<T> {
+    /// Allocate `n` elements of `T`. Tries lgalloc first; falls back to heap
+    /// on allocation failure.
+    pub fn with_capacity(n: usize) -> Self {
+        match Self::try_lgalloc(n) {
+            Ok(buf) => buf,
+            Err(_) => Self::heap(n),
+        }
+    }
+
+    /// Allocate `n` elements of `T` from lgalloc. Returns `AllocError` if the
+    /// allocator is disabled, out of memory, or the element type cannot be
+    /// satisfied.
+    pub fn try_lgalloc(n: usize) -> Result<Self, AllocError> {
+        let (ptr, capacity, handle) = allocate::<T>(n)?;
+        Ok(Self {
+            handle: Some(handle),
+            ptr,
+            capacity,
+        })
+    }
+
+    /// Allocate `n` elements of `T` from the system heap, bypassing lgalloc.
+    pub fn heap(n: usize) -> Self {
+        let mut vec: Vec<MaybeUninit<T>> = Vec::with_capacity(n);
+        let capacity = vec.capacity();
+        let ptr = NonNull::new(vec.as_mut_ptr()).expect("allocator returned null");
+        std::mem::forget(vec);
+        Self {
+            handle: None,
+            ptr: ptr.cast::<T>(),
+            capacity,
+        }
+    }
+
+    /// Capacity, in elements.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Whether the backing is an lgalloc handle (true) or a heap fallback (false).
+    pub fn is_lgalloc(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// View the buffer as a slice of `MaybeUninit<T>`.
+    pub fn as_uninit_slice(&self) -> &[MaybeUninit<T>] {
+        // SAFETY: ptr is valid for `capacity` elements; MaybeUninit requires no initialization.
+        unsafe {
+            std::slice::from_raw_parts(self.ptr.as_ptr().cast::<MaybeUninit<T>>(), self.capacity)
+        }
+    }
+
+    /// View the buffer as a mutable slice of `MaybeUninit<T>`.
+    pub fn as_uninit_slice_mut(&mut self) -> &mut [MaybeUninit<T>] {
+        // SAFETY: ptr is valid for `capacity` elements; MaybeUninit requires no initialization.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.ptr.as_ptr().cast::<MaybeUninit<T>>(),
+                self.capacity,
+            )
+        }
+    }
+
+    /// Consume the buffer into its raw parts.
+    pub fn into_raw_parts(self) -> (NonNull<T>, usize, Option<Handle>) {
+        // SAFETY: reading by value out of self and forgetting self; no double-drop.
+        let parts = unsafe {
+            (
+                std::ptr::read(&self.ptr),
+                self.capacity,
+                std::ptr::read(&self.handle),
+            )
+        };
+        std::mem::forget(self);
+        parts
+    }
+
+    /// Reconstruct a `RawBuffer` from its raw parts.
+    ///
+    /// # Safety
+    ///
+    /// The pointer, capacity, and handle must have come from a prior call to
+    /// [`RawBuffer::into_raw_parts`] on the same process, and none of them
+    /// must have been freed or reconstructed since.
+    pub unsafe fn from_raw_parts(
+        ptr: NonNull<T>,
+        capacity: usize,
+        handle: Option<Handle>,
+    ) -> Self {
+        Self { handle, ptr, capacity }
+    }
+}
+
+impl<T> Drop for RawBuffer<T> {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            // The inner Handle's own Drop returns the allocation to the pool when
+            // self.handle is dropped along with Self.
+        } else {
+            // Heap fallback: reconstruct the Vec we originally made and let it drop.
+            // SAFETY: heap allocations were made via Vec::<MaybeUninit<T>>::with_capacity;
+            // reconstructing with len=0 + same capacity matches the original layout.
+            unsafe {
+                let _ = Vec::<MaybeUninit<T>>::from_raw_parts(
+                    self.ptr.as_ptr().cast::<MaybeUninit<T>>(),
+                    0,
+                    self.capacity,
+                );
+            }
         }
     }
 }

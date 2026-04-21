@@ -1,6 +1,11 @@
+use std::sync::Mutex;
 use std::time::Duration;
 use hugalloc::ConfigError;
 use hugalloc::stats;
+
+/// Serializes tests that write to the global hugalloc configuration or rely on
+/// the background-worker tick rate, which is process-global state.
+static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
 
 fn reset_to_defaults() {
     hugalloc::builder()
@@ -16,6 +21,7 @@ fn reset_to_defaults() {
 
 #[test]
 fn builder_chain_is_expression() -> Result<(), ConfigError> {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
     hugalloc::builder()
         .enable()
         .eager_return(true)
@@ -29,6 +35,7 @@ fn builder_chain_is_expression() -> Result<(), ConfigError> {
 
 #[test]
 fn builder_partial_update_preserves_others() -> Result<(), ConfigError> {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
     reset_to_defaults();
     hugalloc::builder().growth_dampener(7).apply()?;
     let _ = hugalloc::allocate::<u8>(2 << 20).expect("allocate");
@@ -37,6 +44,7 @@ fn builder_partial_update_preserves_others() -> Result<(), ConfigError> {
 
 #[test]
 fn background_decay_drains_backlog() {
+    let _guard = GLOBAL_STATE_LOCK.lock().unwrap();
     // Configure short ticks, small floor, full decay.
     hugalloc::builder()
         .enable()
