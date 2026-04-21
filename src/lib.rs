@@ -318,6 +318,14 @@ pub enum AdviseError {
     },
 }
 
+/// Errors from [`Builder::apply`].
+#[derive(Error, Debug)]
+pub enum ConfigError {
+    /// The background worker thread failed to spawn.
+    #[error("failed to spawn background worker thread: {0}")]
+    BackgroundWorkerFailed(#[from] std::io::Error),
+}
+
 impl AllocError {
     /// Check if this error is [`AllocError::Disabled`].
     #[must_use]
