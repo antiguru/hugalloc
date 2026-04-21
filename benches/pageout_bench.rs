@@ -37,6 +37,15 @@
 //! * `--recovery` — end-to-end cost of recovering a pageout'd region to a
 //!   fully-THP-backed state. Compares touch, touch+COLLAPSE,
 //!   WILLNEED+touch, WILLNEED+touch+COLLAPSE, and MAP_FIXED remap+touch.
+//! * `--syscall-cost` — cost of `mincore` (full range vs single-page
+//!   sample) and `MAP_FIXED` remap across sizes. Informs per-drop
+//!   overhead of any mincore-on-drop heuristic.
+//! * `--mmap-vs-pool` — cost of fresh `mmap`+first-touch+`munmap` cycle
+//!   compared to `hugalloc::allocate`+first-touch+drop. Quantifies what
+//!   the pool is buying us.
+//! * `--swap-concurrency` — per-thread swap-in latency and aggregate
+//!   throughput as a function of thread count. Requires a cgroup memory
+//!   limit to force actual eviction.
 
 use std::fs;
 use std::time::{Duration, Instant};
@@ -211,6 +220,7 @@ fn stats(samples: &mut [u64]) -> Stats {
         median: samples[n / 2],
         p99: samples[((n as f64 * 0.99) as usize).min(n - 1)],
         mean: samples.iter().sum::<u64>() / n as u64,
+        max: samples[n - 1],
     }
 }
 
@@ -219,6 +229,7 @@ struct Stats {
     median: u64,
     p99: u64,
     mean: u64,
+    max: u64,
 }
 
 fn format_ns(ns: u64) -> String {
@@ -737,6 +748,506 @@ fn run_split_sequence_with_post<F: Fn(&Probe), G: Fn(&Probe)>(
         format_ns(s.p99),
         (thp_avg as f64 / size as f64) * 100.0,
     );
+}
+
+// ---------- Experiment 12: swap concurrency ----------
+
+/// How does swap-in throughput / latency scale with thread count?
+///
+/// Setup (serial): each of `threads` threads owns one `size`-byte region.
+/// All are populated, `MADV_PAGEOUT`'d, and then a pressure buffer is dirty
+/// -allocated sized so all probe pages actually evict to swap. Then the
+/// pressure buffer is dropped (frees RAM).
+///
+/// Race phase: all worker threads start at a barrier, then each synchronously
+/// touches its own region, timing the per-region wall time. Main thread
+/// measures aggregate wall time (max across workers).
+///
+/// Needs a cgroup memory limit so the pressure step actually evicts rather
+/// than just stages.
+#[repr(transparent)]
+struct SendUsize(usize);
+unsafe impl Send for SendUsize {}
+unsafe impl Sync for SendUsize {}
+
+fn run_swap_concurrency() {
+    println!("\n=== experiment 12: swap concurrency scaling ===\n");
+    let cgroup_limit = read_cgroup_memory_max();
+    match cgroup_limit {
+        Some(l) => println!("cgroup memory.max: {} MiB", l >> 20),
+        None => println!(
+            "WARNING: no cgroup limit — swap-in scenario won't force real eviction. \
+             Swap-out (PAGEOUT) still measures real swap I/O regardless."
+        ),
+    }
+    println!();
+    run_swap_concurrency_pageout();
+    run_swap_concurrency_pagein(cgroup_limit);
+}
+
+fn run_swap_concurrency_pageout() {
+    println!("# swap-out (MADV_PAGEOUT) concurrency");
+    println!(
+        "{:>8}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}",
+        "size", "thr", "po_med", "po_p99", "po_max", "wall", "agg_MB/s", "per_thr_MB/s"
+    );
+    println!("{}", "-".repeat(92));
+
+    let sizes: &[usize] = &[2 << 20, 16 << 20];
+    let thread_counts: &[usize] = &[1, 2, 4, 8, 16];
+
+    for &size in sizes {
+        for &threads in thread_counts {
+            // Each thread owns one probe. Populate all serially.
+            let probes: Vec<Probe> = (0..threads).map(|_| Probe::new(size)).collect();
+            let ps = probes[0].page_size;
+            for p in &probes {
+                let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+                for i in (0..slice.len()).step_by(ps) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+            }
+
+            use std::sync::{Arc, Barrier};
+            let probe_addrs: Vec<(SendUsize, SendUsize)> = probes
+                .iter()
+                .map(|p| (SendUsize(p.ptr as usize), SendUsize(p.len)))
+                .collect();
+            let probe_addrs = Arc::new(probe_addrs);
+            let barrier = Arc::new(Barrier::new(threads + 1));
+
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let probe_addrs = Arc::clone(&probe_addrs);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> u64 {
+                        let (ptr, len) = (&probe_addrs[t].0, &probe_addrs[t].1);
+                        let ptr = ptr.0 as *mut libc::c_void;
+                        let len = len.0;
+                        barrier.wait();
+                        let start = Instant::now();
+                        let r = unsafe { libc::madvise(ptr, len, libc::MADV_PAGEOUT) };
+                        let dt = start.elapsed().as_nanos() as u64;
+                        assert_eq!(r, 0);
+                        dt
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            let wall_start = Instant::now();
+            let mut per_thread: Vec<u64> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wall = wall_start.elapsed();
+
+            let s = stats(&mut per_thread);
+            let total_bytes = (size as u64) * (threads as u64);
+            let wall_secs = wall.as_secs_f64();
+            let agg_mbs = (total_bytes as f64 / (1024.0 * 1024.0)) / wall_secs;
+            let per_thr_mbs = agg_mbs / threads as f64;
+
+            println!(
+                "{:>8}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12.1}  {:>10.1}",
+                format_size(size),
+                threads,
+                format_ns(s.median),
+                format_ns(s.p99),
+                format_ns(s.max),
+                format_ns(wall.as_nanos() as u64),
+                agg_mbs,
+                per_thr_mbs,
+            );
+
+            drop(probes);
+        }
+        println!();
+    }
+}
+
+/// Touch every 4 KiB slot. No prefetch.
+fn pagein_touch(ptr: *mut u8, len: usize, ps: usize) {
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+    for i in (0..slice.len()).step_by(ps) {
+        unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+    }
+}
+
+/// Single `MADV_WILLNEED` over the whole range, then touch.
+fn pagein_willneed_full(ptr: *mut u8, len: usize, ps: usize) {
+    unsafe { libc::madvise(ptr.cast(), len, libc::MADV_WILLNEED) };
+    pagein_touch(ptr, len, ps);
+}
+
+/// `MADV_WILLNEED` per 2 MiB chunk, then touch that chunk, before
+/// advancing to the next.
+fn pagein_chunked_2m(ptr: *mut u8, len: usize, ps: usize) {
+    let chunk = 2 << 20;
+    let mut off = 0;
+    while off < len {
+        let clen = (len - off).min(chunk);
+        unsafe {
+            libc::madvise(ptr.add(off).cast(), clen, libc::MADV_WILLNEED);
+            let slice = std::slice::from_raw_parts_mut(ptr.add(off), clen);
+            for i in (0..slice.len()).step_by(ps) {
+                std::ptr::write_volatile(&mut slice[i], 1);
+            }
+        }
+        off += clen;
+    }
+}
+
+/// `MADV_WILLNEED` per 16 MiB chunk, then touch that chunk.
+fn pagein_chunked_16m(ptr: *mut u8, len: usize, ps: usize) {
+    let chunk = 16 << 20;
+    let mut off = 0;
+    while off < len {
+        let clen = (len - off).min(chunk);
+        unsafe {
+            libc::madvise(ptr.add(off).cast(), clen, libc::MADV_WILLNEED);
+            let slice = std::slice::from_raw_parts_mut(ptr.add(off), clen);
+            for i in (0..slice.len()).step_by(ps) {
+                std::ptr::write_volatile(&mut slice[i], 1);
+            }
+        }
+        off += clen;
+    }
+}
+
+/// Windowed prefetch: issue `MADV_WILLNEED` 32 MiB ahead of the touch
+/// cursor so swap readahead runs in parallel with the touch.
+fn pagein_windowed_32m(ptr: *mut u8, len: usize, ps: usize) {
+    let window = 32 << 20;
+    let mut touch_off = 0usize;
+    let mut pf_off = 0usize;
+    let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+    while touch_off < len {
+        // Issue prefetch up to `touch_off + window`.
+        let pf_target = (touch_off + window).min(len);
+        if pf_off < pf_target {
+            let clen = pf_target - pf_off;
+            unsafe { libc::madvise(ptr.add(pf_off).cast(), clen, libc::MADV_WILLNEED) };
+            pf_off = pf_target;
+        }
+        // Touch next chunk (2 MiB per step) up to pf_off.
+        let touch_step = (touch_off + (2 << 20)).min(pf_off).min(len);
+        for i in (touch_off..touch_step).step_by(ps) {
+            unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+        }
+        touch_off = touch_step;
+    }
+}
+
+fn run_swap_concurrency_pagein(cgroup_limit: Option<usize>) {
+    println!("# swap-in (touch after PAGEOUT+pressure) concurrency");
+    for &(label, recover) in &[
+        ("touch only", pagein_touch as fn(*mut u8, usize, usize)),
+        ("WILLNEED full + touch", pagein_willneed_full),
+        ("WILLNEED chunked 2M + touch", pagein_chunked_2m),
+        ("WILLNEED chunked 16M + touch", pagein_chunked_16m),
+        ("WILLNEED windowed 32M + touch", pagein_windowed_32m),
+    ] {
+        run_swap_pagein_strat(cgroup_limit, label, recover);
+    }
+}
+
+fn run_swap_pagein_strat(
+    cgroup_limit: Option<usize>,
+    label: &str,
+    recover: fn(*mut u8, usize, usize),
+) {
+    println!("\n  strategy: {label}");
+    println!(
+        "  {:>8}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12}  {:>10}",
+        "size", "thr", "touch_med", "touch_p99", "touch_max", "wall", "agg_MB/s", "per_thr_MB/s"
+    );
+    println!("  {}", "-".repeat(90));
+
+    // Per-thread region sized small enough that 16 × size + pressure fits the
+    // intended cgroup with room for kernel overhead.
+    let sizes: &[usize] = &[2 << 20, 16 << 20];
+    let thread_counts: &[usize] = &[1, 2, 4, 8, 16];
+
+    for &size in sizes {
+        for &threads in thread_counts {
+            // Allocate + populate + pageout in serial.
+            let probes: Vec<Probe> = (0..threads).map(|_| Probe::new(size)).collect();
+            let ps = probes[0].page_size;
+            for p in &probes {
+                let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+                for i in (0..slice.len()).step_by(ps) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+            }
+            for p in &probes {
+                unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_PAGEOUT) };
+            }
+
+            // Force eviction: pressure buffer sized to push total commit
+            // above the cgroup limit.
+            if let Some(limit) = cgroup_limit {
+                let target = limit
+                    .saturating_mul(3)
+                    .checked_div(2)
+                    .unwrap_or(0)
+                    .saturating_sub(size * threads)
+                    .max(size * threads * 2);
+                let pressure_size = target.next_power_of_two();
+                let pr = Probe::new(pressure_size);
+                let pslice = unsafe { std::slice::from_raw_parts_mut(pr.ptr, pr.len) };
+                for i in (0..pslice.len()).step_by(pr.page_size) {
+                    unsafe { std::ptr::write_volatile(&mut pslice[i], 1) };
+                }
+                drop(pr);
+            }
+
+            // Race: each thread touches one probe.
+            use std::sync::{Arc, Barrier};
+            let probe_addrs: Vec<(SendUsize, SendUsize)> = probes
+                .iter()
+                .map(|p| (SendUsize(p.ptr as usize), SendUsize(p.len)))
+                .collect();
+            let probe_addrs = Arc::new(probe_addrs);
+            let barrier = Arc::new(Barrier::new(threads + 1));
+
+            let handles: Vec<_> = (0..threads)
+                .map(|t| {
+                    let probe_addrs = Arc::clone(&probe_addrs);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || -> u64 {
+                        let (ptr, len) = (&probe_addrs[t].0, &probe_addrs[t].1);
+                        let ptr = ptr.0 as *mut u8;
+                        let len = len.0;
+                        barrier.wait();
+                        let start = Instant::now();
+                        recover(ptr, len, ps);
+                        start.elapsed().as_nanos() as u64
+                    })
+                })
+                .collect();
+
+            barrier.wait();
+            let wall_start = Instant::now();
+            let mut per_thread: Vec<u64> =
+                handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let wall = wall_start.elapsed();
+
+            let s = stats(&mut per_thread);
+            let total_bytes = (size as u64) * (threads as u64);
+            let wall_secs = wall.as_secs_f64();
+            let agg_mbs = (total_bytes as f64 / (1024.0 * 1024.0)) / wall_secs;
+            let per_thr_mbs = agg_mbs / threads as f64;
+
+            println!(
+                "  {:>8}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>12.1}  {:>10.1}",
+                format_size(size),
+                threads,
+                format_ns(s.median),
+                format_ns(s.p99),
+                format_ns(s.max),
+                format_ns(wall.as_nanos() as u64),
+                agg_mbs,
+                per_thr_mbs,
+            );
+
+            drop(probes); // munmap all
+        }
+    }
+}
+
+// ---------- Experiment 10: mincore / remap syscall cost ----------
+
+/// Measures per-drop candidate overheads:
+///   - `mincore` over the whole range (cost scales with region size)
+///   - `mincore` over a single page (constant cost — sampling variant)
+///   - `MAP_FIXED` remap + `MADV_HUGEPAGE` (mitigation cost)
+///
+/// All on a populated THP-backed probe so the kernel's PTE/PMD state is
+/// realistic.
+fn run_syscall_cost() {
+    println!("\n=== experiment 10: per-drop syscall candidates ===\n");
+    println!(
+        "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+        "size", "call", "min", "median", "p99"
+    );
+    println!("{}", "-".repeat(72));
+    for &size in SIZES {
+        let reps = reps_for(size).max(30);
+        let ps = page_size::get();
+
+        // Full mincore.
+        {
+            let p = Probe::new(size);
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(ps) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+            let mut buf = vec![0u8; size / ps];
+            let mut times = Vec::with_capacity(reps);
+            // Warm.
+            unsafe { libc::mincore(p.ptr.cast(), p.len, buf.as_mut_ptr()) };
+            for _ in 0..reps {
+                let start = Instant::now();
+                let r = unsafe { libc::mincore(p.ptr.cast(), p.len, buf.as_mut_ptr()) };
+                times.push(start.elapsed().as_nanos() as u64);
+                assert_eq!(r, 0);
+            }
+            let s = stats(&mut times);
+            println!(
+                "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+                format_size(size),
+                "mincore (full range)",
+                format_ns(s.min),
+                format_ns(s.median),
+                format_ns(s.p99),
+            );
+        }
+
+        // Single-page mincore (sample).
+        {
+            let p = Probe::new(size);
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(ps) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+            let mut one = [0u8; 1];
+            let mut times = Vec::with_capacity(reps);
+            unsafe { libc::mincore(p.ptr.cast(), ps, one.as_mut_ptr()) };
+            for _ in 0..reps {
+                let start = Instant::now();
+                let r = unsafe { libc::mincore(p.ptr.cast(), ps, one.as_mut_ptr()) };
+                times.push(start.elapsed().as_nanos() as u64);
+                assert_eq!(r, 0);
+            }
+            let s = stats(&mut times);
+            println!(
+                "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+                format_size(size),
+                "mincore (1 page)",
+                format_ns(s.min),
+                format_ns(s.median),
+                format_ns(s.p99),
+            );
+        }
+
+        // MAP_FIXED remap.
+        {
+            let mut times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let p = Probe::new(size);
+                let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+                for i in (0..slice.len()).step_by(ps) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+                let start = Instant::now();
+                let r = unsafe {
+                    libc::mmap(
+                        p.ptr.cast(),
+                        p.len,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                        -1,
+                        0,
+                    )
+                };
+                let _ = unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_HUGEPAGE) };
+                times.push(start.elapsed().as_nanos() as u64);
+                assert_ne!(r, libc::MAP_FAILED);
+            }
+            let s = stats(&mut times);
+            println!(
+                "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+                format_size(size),
+                "MAP_FIXED remap + MADV_HUGEPAGE",
+                format_ns(s.min),
+                format_ns(s.median),
+                format_ns(s.p99),
+            );
+        }
+
+        println!();
+    }
+}
+
+// ---------- Experiment 11: mmap + first-touch vs pool ----------
+
+/// Compares the cost of the two extreme dealloc strategies: `munmap`
+/// everything and `mmap` fresh on the next alloc vs keep in the pool
+/// (zero-cost recycle).
+fn run_mmap_vs_pool() {
+    println!("\n=== experiment 11: fresh mmap+touch+munmap vs pool recycle ===\n");
+    println!(
+        "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+        "size", "strategy", "min", "median", "p99"
+    );
+    println!("{}", "-".repeat(72));
+
+    hugalloc::builder()
+        .enable()
+        .eager_return(false)
+        .local_buffer_bytes(0)
+        .apply()
+        .expect("apply");
+
+    for &size in SIZES {
+        let reps = reps_for(size).max(20);
+        let ps = page_size::get();
+
+        // Fresh mmap + touch + munmap cycle.
+        {
+            let mut times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let start = Instant::now();
+                let p = Probe::new(size);
+                let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+                for i in (0..slice.len()).step_by(ps) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+                drop(p); // munmap
+                times.push(start.elapsed().as_nanos() as u64);
+            }
+            let s = stats(&mut times);
+            println!(
+                "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+                format_size(size),
+                "fresh mmap+touch+munmap",
+                format_ns(s.min),
+                format_ns(s.median),
+                format_ns(s.p99),
+            );
+        }
+
+        // Warm the pool with one region.
+        {
+            let (_, _, h) = hugalloc::allocate::<u8>(size).unwrap();
+            drop(h);
+        }
+
+        // hugalloc alloc + touch + drop (pool recycles warm region).
+        {
+            let mut times = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let start = Instant::now();
+                let (ptr, cap, h) = hugalloc::allocate::<u8>(size).unwrap();
+                let slice = unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), cap) };
+                for i in (0..slice.len()).step_by(ps) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+                drop(h);
+                times.push(start.elapsed().as_nanos() as u64);
+            }
+            let s = stats(&mut times);
+            println!(
+                "{:>8}  {:<30}  {:>9}  {:>9}  {:>9}",
+                format_size(size),
+                "hugalloc alloc+touch+drop",
+                format_ns(s.min),
+                format_ns(s.median),
+                format_ns(s.p99),
+            );
+        }
+
+        println!();
+    }
 }
 
 // ---------- Experiment 9: recovery path costs ----------
@@ -1349,7 +1860,10 @@ fn main() {
         || want("--pool")
         || want("--split-recovery")
         || want("--collapse-probe")
-        || want("--recovery");
+        || want("--recovery")
+        || want("--syscall-cost")
+        || want("--mmap-vs-pool")
+        || want("--swap-concurrency");
     if !any_flag || want("--baseline") {
         run_baseline();
     }
@@ -1373,6 +1887,15 @@ fn main() {
     }
     if want("--recovery") {
         run_recovery();
+    }
+    if want("--syscall-cost") {
+        run_syscall_cost();
+    }
+    if want("--mmap-vs-pool") {
+        run_mmap_vs_pool();
+    }
+    if want("--swap-concurrency") {
+        run_swap_concurrency();
     }
 }
 
