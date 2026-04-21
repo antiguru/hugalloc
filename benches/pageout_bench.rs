@@ -34,6 +34,9 @@
 //!   page in? Does it reconstitute PMDs? Runs three scenarios: idle (pages
 //!   still mapped), under pressure (pages evicted to swap — requires cgroup),
 //!   and a PMD-split baseline.
+//! * `--recovery` — end-to-end cost of recovering a pageout'd region to a
+//!   fully-THP-backed state. Compares touch, touch+COLLAPSE,
+//!   WILLNEED+touch, WILLNEED+touch+COLLAPSE, and MAP_FIXED remap+touch.
 
 use std::fs;
 use std::time::{Duration, Instant};
@@ -733,6 +736,178 @@ fn run_split_sequence_with_post<F: Fn(&Probe), G: Fn(&Probe)>(
     );
 }
 
+// ---------- Experiment 9: recovery path costs ----------
+
+/// End-to-end cost of recovering a region from "populated + PAGEOUT'd
+/// (+ optionally pressure-evicted)" back to fully THP-backed and usable.
+///
+/// Recovery paths:
+///   A) touch only — the bug baseline. Region ends 4 KiB-backed.
+///   B) touch + `MADV_COLLAPSE`.
+///   C) `MADV_WILLNEED` + touch — does WILLNEED accelerate swap-in?
+///   D) `MADV_WILLNEED` + touch + `MADV_COLLAPSE`.
+///   E) `MAP_FIXED` remap + `MADV_HUGEPAGE` + touch — pool-level mitigation
+///      candidate. Discards whatever swap-backed state existed, starts fresh.
+fn run_recovery() {
+    println!("\n=== experiment 9: recovery path costs ===\n");
+    let cgroup_limit = read_cgroup_memory_max();
+    match cgroup_limit {
+        Some(l) => println!("cgroup memory.max: {} MiB — pages actually evicted before recovery", l >> 20),
+        None => println!(
+            "no cgroup limit — PAGEOUT stages swap, pages stay mapped (idle regime)"
+        ),
+    }
+    println!();
+    println!(
+        "{:>8}  {:<42}  {:>11}  {:>11}  {:>7}  {:>7}",
+        "size", "path", "time_med", "time_p99", "res%", "thp%"
+    );
+    println!("{}", "-".repeat(100));
+
+    // Skip 1 GiB — too big for 512 MiB cgroup and the signal at 128 MiB is
+    // already decisive.
+    let sizes: &[usize] = &[2 << 20, 16 << 20, 128 << 20];
+
+    for &size in sizes {
+        let reps = 5;
+        let pressure_size = cgroup_limit.map(|l| {
+            (l.saturating_mul(3) / 2)
+                .saturating_sub(size)
+                .max(size * 2)
+                .next_power_of_two()
+        });
+
+        run_recovery_path(size, reps, pressure_size, "touch only (bug baseline)", |p| {
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(p.page_size) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+        });
+
+        run_recovery_path(size, reps, pressure_size, "touch + COLLAPSE", |p| {
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(p.page_size) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+            unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_COLLAPSE_NUM) };
+        });
+
+        run_recovery_path(size, reps, pressure_size, "WILLNEED + touch", |p| {
+            unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_WILLNEED) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(p.page_size) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+        });
+
+        run_recovery_path(
+            size,
+            reps,
+            pressure_size,
+            "WILLNEED + touch + COLLAPSE",
+            |p| {
+                unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_WILLNEED) };
+                let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+                for i in (0..slice.len()).step_by(p.page_size) {
+                    unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+                }
+                unsafe { libc::madvise(p.ptr.cast(), p.len, MADV_COLLAPSE_NUM) };
+            },
+        );
+
+        run_recovery_path(size, reps, pressure_size, "MAP_FIXED remap + touch", |p| {
+            // Replace the mapping at the same address. Kernel zaps PTEs and
+            // discards any swap entries for this range. New mapping has no
+            // VMA flags by default, so re-apply MADV_HUGEPAGE.
+            //
+            // SAFETY: `p.ptr..p.ptr+p.len` is a live mapping we own; MAP_FIXED
+            // on the exact same range atomically replaces it.
+            let fresh = unsafe {
+                libc::mmap(
+                    p.ptr.cast(),
+                    p.len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                    -1,
+                    0,
+                )
+            };
+            assert_eq!(fresh, p.ptr.cast::<libc::c_void>(), "MAP_FIXED remap");
+            unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_HUGEPAGE) };
+            let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+            for i in (0..slice.len()).step_by(p.page_size) {
+                unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+            }
+        });
+
+        println!();
+    }
+
+    println!("Legend:");
+    println!("  time_med / time_p99  wall time of the recovery sequence");
+    println!("  res%                 final mincore residency");
+    println!("  thp%                 final AnonHugePages / region size");
+    println!();
+    println!("Pre-recovery setup each rep: Probe::new → populate → MADV_PAGEOUT");
+    println!("  + (if cgroup) allocate & dirty a 1.5× memory.max pressure buffer,");
+    println!("    then drop it, so the probe's pages are truly in swap.");
+}
+
+fn run_recovery_path(
+    size: usize,
+    reps: usize,
+    pressure_size: Option<usize>,
+    label: &str,
+    recover: impl Fn(&Probe),
+) {
+    let mut times = Vec::with_capacity(reps);
+    let mut res = Vec::with_capacity(reps);
+    let mut thp = Vec::with_capacity(reps);
+
+    for _ in 0..reps {
+        let p = Probe::new(size);
+        let slice = unsafe { std::slice::from_raw_parts_mut(p.ptr, p.len) };
+        for i in (0..slice.len()).step_by(p.page_size) {
+            unsafe { std::ptr::write_volatile(&mut slice[i], 1) };
+        }
+        // SAFETY: advisory on our mapping.
+        let r = unsafe { libc::madvise(p.ptr.cast(), p.len, libc::MADV_PAGEOUT) };
+        assert_eq!(r, 0, "PAGEOUT: {}", std::io::Error::last_os_error());
+
+        if let Some(ps) = pressure_size {
+            let pr = Probe::new(ps);
+            let pslice = unsafe { std::slice::from_raw_parts_mut(pr.ptr, pr.len) };
+            for i in (0..pslice.len()).step_by(pr.page_size) {
+                unsafe { std::ptr::write_volatile(&mut pslice[i], 1) };
+            }
+            drop(pr);
+        }
+
+        let start = Instant::now();
+        recover(&p);
+        let dt = start.elapsed();
+        times.push(dt.as_nanos() as u64);
+
+        let (r, t) = p.residency();
+        res.push((r as f64 / t as f64) * 100.0);
+        thp.push(p.anon_huge_bytes());
+    }
+
+    let s = stats(&mut times);
+    let res_avg = res.iter().sum::<f64>() / res.len() as f64;
+    let thp_avg = thp.iter().sum::<usize>() / thp.len();
+
+    println!(
+        "{:>8}  {:<42}  {:>11}  {:>11}  {:>6.1}%  {:>6.1}%",
+        format_size(size),
+        label,
+        format_ns(s.median),
+        format_ns(s.p99),
+        res_avg,
+        (thp_avg as f64 / size as f64) * 100.0,
+    );
+}
+
 // ---------- Experiment 8: MADV_COLLAPSE on paged data ----------
 
 /// What happens when you call `MADV_COLLAPSE` on a region whose PMDs have
@@ -1137,7 +1312,8 @@ fn main() {
         || want("--swap-probe")
         || want("--pool")
         || want("--split-recovery")
-        || want("--collapse-probe");
+        || want("--collapse-probe")
+        || want("--recovery");
     if !any_flag || want("--baseline") {
         run_baseline();
     }
@@ -1158,6 +1334,9 @@ fn main() {
     }
     if want("--collapse-probe") {
         run_collapse_probe();
+    }
+    if want("--recovery") {
+        run_recovery();
     }
 }
 
