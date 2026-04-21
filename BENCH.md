@@ -1,4 +1,4 @@
-# Running lgalloc benchmarks on a target host
+# Running hugalloc benchmarks on a target host
 
 ## Prerequisites
 
@@ -16,7 +16,7 @@ The binary is at `target/release/deps/alloc_bench-*` (pick the newest non-`.d` f
 
 ## Throughput benchmarks
 
-Measures lgalloc, system allocator, and raw mmap across 1/2/4/8/16 threads.
+Measures hugalloc, system allocator, and raw mmap across 1/2/4/8/16 threads.
 Limits: 4G RAM, no swap, 16 CPUs.
 
 ```sh
@@ -46,15 +46,15 @@ systemd-run --user -p MemoryMax=128M -p MemorySwapMax=4G -p CPUQuota=1600% \
 
 ## What to look at
 
-* **lgalloc vs sysalloc+touch**: the main comparison.
-  lgalloc reuses faulted pages; the system allocator mmaps/munmaps on each cycle.
+* **hugalloc vs sysalloc+touch**: the main comparison.
+  hugalloc reuses faulted pages; the system allocator mmaps/munmaps on each cycle.
 * **sysalloc+touch vs sysalloc+nohuge+touch**: quantifies THP benefit for the system allocator.
   If the host has THP=`never`, these should be similar.
-* **Scaling**: lgalloc should scale linearly (lock-free work-stealing);
+* **Scaling**: hugalloc should scale linearly (lock-free work-stealing);
   sysalloc and mmap degrade due to kernel mmap_lock contention.
 * **Paging CCDF**: bimodal distribution — resident pages (µs) vs swap-in (ms).
   The tail shows swap I/O latency of the target host's storage.
-* **realloc+touch from swapped pool**: lgalloc recycles virtual addresses without syscalls,
+* **realloc+touch from swapped pool**: hugalloc recycles virtual addresses without syscalls,
   so the cost is just page faults, not mmap+fault.
 
 ## Ratio sweep
@@ -100,7 +100,7 @@ Multi-threaded scaling is near-linear on NVMe:
 
 #### Realloc+touch is unaffected by swap pressure
 
-lgalloc recycles the same virtual pages; the kernel keeps the hot working page
+hugalloc recycles the same virtual pages; the kernel keeps the hot working page
 resident since it is touched immediately after dealloc:
 
 | RAM    | Ratio | ops/s   | p50   |
@@ -187,8 +187,8 @@ Check:
 cat /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
-* `always` — THP on all anonymous mappings (lgalloc and sysalloc both benefit)
-* `madvise` — THP only for regions with MADV_HUGEPAGE (lgalloc benefits, sysalloc does not)
-* `never` — no THP (lgalloc's MADV_HUGEPAGE hint is a no-op, warns once)
+* `always` — THP on all anonymous mappings (hugalloc and sysalloc both benefit)
+* `madvise` — THP only for regions with MADV_HUGEPAGE (hugalloc benefits, sysalloc does not)
+* `never` — no THP (hugalloc's MADV_HUGEPAGE hint is a no-op, warns once)
 
 The `sysalloc+nohuge` variants force 4K pages via MADV_NOHUGEPAGE regardless of this setting.

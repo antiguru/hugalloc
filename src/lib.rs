@@ -1,24 +1,43 @@
-//! A size-classed large object allocator backed by anonymous mappings.
+//! Transparent-huge-page large-object allocator with cooperative residency control.
 //!
-//! This library contains types to allocate memory outside the heap,
-//! supporting power-of-two object sizes. Each size class has its own
-//! memory pool.
+//! hugalloc allocates in power-of-two size classes from 2 MiB to 128 GiB, backed
+//! by anonymous `mmap` + `MADV_HUGEPAGE` on Linux. The allocator pool is managed
+//! by a per-size-class work-stealing queue with per-thread buffering.
 //!
-//! Allocations use `MAP_ANONYMOUS` with `MADV_HUGEPAGE` hints to benefit
-//! from transparent huge pages when available.
+//! # Overview
 //!
-//! # Safety
+//! The two most useful entry points for users:
 //!
-//! This library is very unsafe on account of `unsafe` and interacting directly
-//! with libc, including Linux extension.
+//! - [`Buffer`] — a Vec-like, length-tracking buffer with lgalloc-or-heap backing.
+//! - [`RawBuffer`] — the underlying fixed-capacity uninitialized primitive.
 //!
-//! The library relies on anonymous memory mappings. Users must not fork the process
-//! because otherwise two processes would share the same mappings, causing undefined behavior
-//! because the mutable pointers would not be unique anymore. Unfortunately, there is no way
-//! to tell the memory subsystem that the shared mappings must not be inherited.
+//! Low-level users can reach for [`allocate`] directly, which returns a [`Handle`]
+//! whose `Drop` returns the allocation to the pool.
 //!
-//! Clients must not lock pages (`mlock`), or need to unlock the pages before returning them
-//! to hugalloc.
+//! # Residency advisories
+//!
+//! Handles and buffers expose three `madvise`-based hints:
+//!
+//! - `prefetch` (portable) — `MADV_WILLNEED`: page in eagerly.
+//! - `cold` (Linux 5.4+) — `MADV_COLD`: mark range as preferred eviction.
+//! - `pageout` (Linux 5.4+) — `MADV_PAGEOUT`: force eviction (requires swap).
+//!
+//! All advisories are hints — they never affect correctness.
+//!
+//! # Configuration
+//!
+//! Use [`builder`] to build a configuration and apply it:
+//!
+//! ```ignore
+//! hugalloc::builder()
+//!     .enable()
+//!     .eager_return(true)
+//!     .apply()?;
+//! ```
+//!
+//! See [`Builder`] for the full list of knobs.
+//!
+//! # Forked from `lgalloc` 0.7.0.
 
 #![deny(missing_docs)]
 
