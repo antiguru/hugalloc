@@ -101,40 +101,18 @@ impl Handle {
         unsafe { self.madvise(libc::MADV_DONTNEED) }
     }
 
-    /// Hint to the kernel that a range of elements will be needed soon.
+    /// Issue a `madvise` hint over a byte range of this allocation.
     ///
-    /// Issues `MADV_WILLNEED` to initiate asynchronous page-in for elements
-    /// `range.start..range.end` of type `T`, which is especially useful when pages may
-    /// reside in swap. The kernel begins reading pages in the background; a subsequent
-    /// access to a prefetched page will either find it already resident or wait for a
-    /// shorter I/O.
-    ///
-    /// `T` should match the element type used with [`allocate`]. Use `u8` for
-    /// byte-granularity prefetch.
-    ///
-    /// The resulting byte range does not need to be page-aligned — the kernel rounds
-    /// to page boundaries internally.
-    ///
-    /// This is a performance hint and never affects correctness. The kernel may ignore
-    /// it under memory pressure. Calling it on already-resident pages is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdviseError::OutOfBounds`] if the byte range exceeds the allocation length.
-    pub fn prefetch<T>(&self, range: Range<usize>) -> Result<(), AdviseError> {
-        let elem_size = std::mem::size_of::<T>();
-        let byte_offset = range.start.checked_mul(elem_size);
-        let byte_len = (range.end - range.start).checked_mul(elem_size);
-        let (byte_offset, byte_len) = match (byte_offset, byte_len) {
-            (Some(o), Some(l)) => (o, l),
-            _ => {
-                return Err(AdviseError::OutOfBounds {
-                    byte_offset: range.start.saturating_mul(elem_size),
-                    byte_len: range.len().saturating_mul(elem_size),
-                    allocation_len: self.len,
-                });
-            }
-        };
+    /// Performs the bounds check and the zero-length / dangling short-circuit.
+    /// The kernel return code is discarded — advisories are hints that never
+    /// affect correctness.
+    fn advise_range(
+        &self,
+        byte_range: Range<usize>,
+        advice: libc::c_int,
+    ) -> Result<(), AdviseError> {
+        let byte_offset = byte_range.start;
+        let byte_len = byte_range.end.saturating_sub(byte_range.start);
         if byte_len == 0 || self.is_dangling() {
             return Ok(());
         }
@@ -145,13 +123,31 @@ impl Handle {
                 allocation_len: self.len,
             });
         }
-        // SAFETY: MADV_WILLNEED is a hint that never modifies memory contents.
-        // The pointer arithmetic is in-bounds per the check above.
+        // SAFETY: advisory hint, ptr in-bounds by check above.
         unsafe {
             let ptr = self.as_non_null().as_ptr().add(byte_offset);
-            libc::madvise(ptr.cast(), byte_len, libc::MADV_WILLNEED);
+            libc::madvise(ptr.cast(), byte_len, advice);
         }
         Ok(())
+    }
+
+    /// Hint that a byte range will be needed soon.
+    ///
+    /// Issues `MADV_WILLNEED` over `byte_range`. The kernel begins paging the
+    /// range in; a subsequent access will find it resident or wait for a
+    /// shorter I/O.
+    ///
+    /// The byte range does not need to be page-aligned — the kernel rounds
+    /// to page boundaries internally.
+    ///
+    /// This is a performance hint and never affects correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdviseError::OutOfBounds`] if `byte_range.end` exceeds the
+    /// allocation length.
+    pub fn prefetch(&self, byte_range: Range<usize>) -> Result<(), AdviseError> {
+        self.advise_range(byte_range, libc::MADV_WILLNEED)
     }
 
     /// Consume the handle and return its raw components. The caller becomes
